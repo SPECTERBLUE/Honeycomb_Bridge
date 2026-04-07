@@ -44,7 +44,8 @@ def start_redis_thread():
 if __name__ == "__main__":
     try:
         from api_downlink import models, database, auth
-                
+        from Notifications.db_notification import models as notification_models  
+       
         logger.info("Initializing database...")
         models.Base.metadata.create_all(bind=database.engine)
 
