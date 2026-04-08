@@ -319,7 +319,8 @@ def admin_JWT_token_generator():
             return
 
         logger.info("JWT token fetched for admin.")
-
+        return jwt_token
+    
     except requests.RequestException as req_err:
         logger.error(f"Failed to fetch admin JWT token: {req_err}")
         return
