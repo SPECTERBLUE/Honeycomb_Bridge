@@ -17,6 +17,7 @@ from forgot_password import generate_reset_token, verify_reset_token
 from typing import Optional
 from Predictive_ML import fetch_assets_telemetry
 from Predictive_ML import telemetry_processor
+from fastapi import BackgroundTasks, HTTPException, Depends
 from Predictive_ML.training_dataset_csv_creation import (
     create_training_dataset_csv
 )
@@ -1930,43 +1931,72 @@ class TrainModelRequest(BaseModel):
     target_column: str  # "label" or the name of the target column in the dataset
     horizon: Literal["1h", "6h", "24h"]
 
+# ─────────────────────────────────────────────
+# Key builders
+# ─────────────────────────────────────────────
 
-@app.post("/downlink/predictive_ML/train", summary="Train ML model and store in Redis")
-async def train_model_api(
+def train_job_key(job_id: str, model_name: str, target_column: str) -> str:
+    return f"train:{job_id}:{model_name}:{target_column}"
+
+def pred_job_key(job_id: str, model_name: str, asset_id: str) -> str:
+    return f"pred:{job_id}:{model_name}:{asset_id}"
+
+@app.post("/downlink/predictive_ML/train")
+async def submit_training_job(
     payload: TrainModelRequest,
+    background_tasks: BackgroundTasks,
     current_user=Depends(auth.get_current_user)
 ):
-    try:
-        
-        # 🔹 prevent overwrite
-        existing_models = await stored_list_models()
-        if payload.model_name in existing_models:
-            raise HTTPException(
-                status_code=400,
-                detail="Model name already exists"
+    existing_models = await stored_list_models()
+    if payload.model_name in existing_models:
+        raise HTTPException(status_code=400, detail="Model name already exists")
+ 
+    job_id = str(uuid.uuid4())
+    key = f"train:{job_id}:{payload.model_name}:{payload.target_column}"
+ 
+    await redis_client.set(key, json.dumps({
+        "status": "queued",
+        "model_name": payload.model_name,
+        "target_column": payload.target_column
+    }))
+ 
+    async def _run():
+        try:
+            await redis_client.set(key, json.dumps({"status": "running"}))
+            train_service = TrainService()
+            result = await train_service.train(
+                csv_path=payload.dataset_path,
+                target_column=payload.target_column,
+                user_model_name=payload.model_name,
+                algorithm=payload.model_type,
+                horizon=payload.horizon
             )
-            
-        train_service = TrainService()
-        
-        result = await train_service.train(
-            csv_path=payload.dataset_path,
-            target_column=payload.target_column,
-            user_model_name=payload.model_name,
-            algorithm=payload.model_type,
-            horizon=payload.horizon
-        )
+            await redis_client.set(key, json.dumps({
+                "status": "completed",
+                "model_name": payload.model_name,
+                "target_column": payload.target_column,
+                "metrics": result["metrics"],
+                "metadata": result["metadata"]
+            }))
+        except Exception as e:
+            logging.error(f"Training failed: {e}", exc_info=True)
+            await redis_client.set(key, json.dumps({"status": "failed", "error": str(e)}))
+ 
+    background_tasks.add_task(_run)
+    return {
+        "status": "accepted",
+        "job_id": job_id,
+        "job_key": key,
+        "message": "Training started in background"
+    }
 
-        return {
-            "status": "success",
-            "message": "Model trained and stored in Redis",
-            "model_name": payload.model_name,
-            "metrics": result["metrics"],
-            "metadata": result["metadata"]
-        }
-
-    except Exception as e:
-        logging.error(f"Model training failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Model training failed")
+@app.get("/downlink/predictive_ML/status/train/{job_id}")
+async def get_train_status(job_id: str, current_user=Depends(auth.get_current_user)):
+    keys = await redis_client.keys(f"train:{job_id}:*")
+    if not keys:
+        raise HTTPException(status_code=404, detail="Train job not found")
+    data = await redis_client.get(keys[0])
+    return {"job_key": keys[0], **json.loads(data)}
 
 ############################################################################
 # Model store in redis using pickle for model and JSON for metadata. This allows storing complex ML models and their associated metadata efficiently.
@@ -2020,39 +2050,59 @@ class PredictRequest(BaseModel):
     model_name: str
     asset_id: str
     
-
-@app.post(
-    "/downlink/predictive_ML/predict",
-    summary="Run prediction using stored ML model"
-)
+@app.post("/downlink/predictive_ML/predict", summary="Run prediction using stored ML model")
 async def predict_api(
     payload: PredictRequest,
+    background_tasks: BackgroundTasks,
     current_user=Depends(auth.get_current_user)
 ):
-    try:
-        result = await predict(
-            model_name=payload.model_name,
-            asset_id=payload.asset_id
-        )
+    job_id = str(uuid.uuid4())
+    key = f"pred:{job_id}:{payload.model_name}:{payload.asset_id}"
+ 
+    await redis_client.set(key, json.dumps({
+        "status": "queued",
+        "model_name": payload.model_name,
+        "asset_id": payload.asset_id
+    }))
+ 
+    async def _run():
+        try:
+            await redis_client.set(key, json.dumps({"status": "running"}))
+            result = await predict(model_name=payload.model_name, asset_id=payload.asset_id)
+            if result is None:
+                await redis_client.set(key, json.dumps({
+                    "status": "failed",
+                    "error": "No telemetry data found"
+                }))
+                return
+            await redis_client.set(key, json.dumps({
+                "status": "completed",
+                "model_name": payload.model_name,
+                "asset_id": payload.asset_id,
+                "result": result
+            }))
+        except Exception as e:
+            logging.error(f"Predict job failed: {e}", exc_info=True)
+            await redis_client.set(key, json.dumps({"status": "failed", "error": str(e)}))
+ 
+    background_tasks.add_task(_run)
+    return {
+        "status": "accepted",
+        "job_id": job_id,
+        "job_key": key,
+        "message": "Prediction started in background"
+    }
 
-        if result is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Prediction failed. No telemetry data found."
-            )
+@app.get("/downlink/predictive_ML/status/pred/{job_id}")
+async def get_pred_status(job_id: str, current_user=Depends(auth.get_current_user)):
+    keys = await redis_client.keys(f"pred:{job_id}:*")
+    if not keys:
+        raise HTTPException(status_code=404, detail="Prediction job not found")
+    data = await redis_client.get(keys[0])
+    return {"job_key": keys[0], **json.loads(data)}
+ 
 
-        return result
 
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        logging.error(f"Prediction API failed: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail="Prediction failed"
-        )
-        
 #########################################################################################
 # apis for brousing and managing the redis database for predictive maintenance models and telemetry data can be added here. This would include endpoints to list all keys, view specific key values, and delete keys from the Redis database. These APIs would help users manage their stored models and telemetry data effectively.
 #########################################################################################
@@ -2269,125 +2319,199 @@ class Assettelemertyfetchandtrainrequest(BaseModel):
         gt=0,
         description="Window length in seconds for aggregation"
     )
-    
-@app.post(
-    "/downlink/predictive_ML/Asset_specific/assets/fetch-train",
-    summary="Fetch telemetry for an asset, process it and train a model"
-)
+
+@app.post("/downlink/predictive_ML/Asset_specific/assets/fetch-train", summary="Fetch telemetry, process and train a model")
 async def fetch_train_asset_model(
     payload: Assettelemertyfetchandtrainrequest,
+    background_tasks: BackgroundTasks,
     current_user=Depends(auth.get_current_user)
 ):
-    try:
-        # 1. Fetch telemetry data for the asset
-        telemetry_fetcher = fetch_assets_telemetry.FetchAssetsTelemetry()
-        telemetry_data = telemetry_fetcher.get_telemetry_data_asset(payload.asset_id)
-
-        if telemetry_data is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Failed to fetch telemetry data for the asset."
+    job_id = str(uuid.uuid4())
+    key = f"train:{job_id}:{payload.model_name}:{payload.target_column}"
+ 
+    await redis_client.set(key, json.dumps({
+        "status": "queued",
+        "model_name": payload.model_name,
+        "target_column": payload.target_column
+    }))
+ 
+    async def _run():
+        try:
+            await redis_client.set(key, json.dumps({"status": "running"}))
+ 
+            telemetry_fetcher = fetch_assets_telemetry.FetchAssetsTelemetry()
+            telemetry_data = telemetry_fetcher.get_telemetry_data_asset(payload.asset_id)
+            if telemetry_data is None:
+                await redis_client.set(key, json.dumps({
+                    "status": "failed",
+                    "error": "Failed to fetch telemetry data"
+                }))
+                return
+ 
+            processor = telemetry_processor.TelemetryProcessor(telemetry_data)
+            processed_data = processor.aggregate_window(window_size_sec=payload.window_length)
+            processed_data = telemetry_processor.handle_missing_windows(processed_data)
+            await redis_client.set(f"Window_length:{payload.asset_id}", payload.window_length)
+ 
+            sensor_map_json = await redis_client.get(f"sensor_map:{payload.model_name}")
+            if not sensor_map_json:
+                await redis_client.set(key, json.dumps({
+                    "status": "failed",
+                    "error": f"Sensor mapping not found for model: {payload.model_name}"
+                }))
+                return
+ 
+            sensor_map = json.loads(sensor_map_json)
+ 
+            threshold_map = {}
+            if payload.model_name == "Slipring Induction motor 60kw":
+                sensor_thresholds = {
+                    "Vibration_avg":      {"prefailure": 5.0,  "failure": 7.0},
+                    "Temperature_avg":    {"prefailure": 80.0, "failure": 90.0},
+                    "Stator_Current_avg": {"prefailure": 10.0, "failure": 15.0},
+                    "Rotor_Current_avg":  {"prefailure": 8.0,  "failure": 12.0},
+                }
+                threshold_map = {
+                    sensor_map[k]: v
+                    for k, v in sensor_thresholds.items()
+                    if k in sensor_map
+                }
+ 
+            labeled_data = telemetry_processor.label_data(
+                aggregated_data=processed_data,
+                threshold_map=threshold_map
             )
-
-        # 2. Process telemetry data (aggregation, labeling, etc.)
-        processor = telemetry_processor.TelemetryProcessor(telemetry_data)
-        processed_data = processor.aggregate_window(
-            window_size_sec=payload.window_length
-        )
-        processed_data = telemetry_processor.handle_missing_windows(processed_data)
-        
-        await redis_client.set(f"Window_length:{payload.asset_id}", payload.window_length)
-        
-        sensor_map_json = await redis_client.get(f"sensor_map:{payload.model_name}")
-        if not sensor_map_json:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Sensor mapping not found for model: {payload.model_name}. Register it first via /sensor-mapping"
+ 
+            train_service = TrainService()
+            result = await train_service.train_specific_model(
+                labeled_data=labeled_data,
+                target_column=payload.target_column,
+                user_model_name=payload.model_name,
+                algorithm=payload.model_type,
+                horizon=payload.horizon,
+                equipment_type=payload.model_name,
+                thresholds=threshold_map,
             )
-        sensor_map = json.loads(sensor_map_json)
-        # sensor_map = {"vibration": "Vibration", "temperature": "Temperature", "stator_current": "Stator_Current", ...}
-        # 🔹 Define thresholds per sensor (values are model-specific)
-        threshold_map = {}
-        if payload.model_name == "Slipring Induction motor 60kw":
-            sensor_thresholds = {
-                "Vibration_avg": {"prefailure": 5.0, "failure": 7.0},
-                "Temperature_avg": {"prefailure": 80.0, "failure": 90.0},
-                "Stator_Current_avg": {"prefailure": 10.0, "failure": 15.0},
-                "Rotor_Current_avg": {"prefailure": 8.0, "failure": 12.0}
-            }
-            # 🔹 Build threshold_map using only sensors registered in Redis
-            threshold_map = {
-            sensor_map[key]: value
-            for key, value in sensor_thresholds.items()
-            if key in sensor_map
-        }
-        
-        labeled_data = telemetry_processor.label_data(
-            aggregated_data=processed_data,
-            threshold_map=threshold_map
-        )
-        
-        train_service = TrainService()      
-        
-        result = await train_service.train_specific_model(
-            labeled_data=labeled_data,
-            target_column=payload.target_column,
-            user_model_name=payload.model_name,
-            algorithm=payload.model_type,
-            horizon=payload.horizon,
-            equipment_type=payload.model_name,
-            thresholds=threshold_map
-        )
-        
-        return {
-            "status": "success",
-            "message": "Model trained and stored in Redis",
-            "model_name": payload.model_name,
-            "metrics": result["metrics"],
-            "metadata": result["metadata"]
-        }
+ 
+            await redis_client.set(key, json.dumps({
+                "status": "completed",
+                "model_name": payload.model_name,
+                "target_column": payload.target_column,
+                "metrics": result["metrics"],
+                "metadata": result["metadata"]
+            }))
+        except Exception as e:
+            logging.error(f"Fetch-train job failed: {e}", exc_info=True)
+            await redis_client.set(key, json.dumps({"status": "failed", "error": str(e)}))
+ 
+    background_tasks.add_task(_run)
+    return {
+        "status": "accepted",
+        "job_id": job_id,
+        "job_key": key,
+        "message": "Fetch-train started in background"
+    }
     
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Asset-specific model training failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Asset-specific model training failed")
+    
 class PredictSpecificRequest(BaseModel):
     model_name: str
     asset_id: str
     
-@app.post(
-    "/downlink/predictive_ML/Asset_specific/predict",
-    summary="Run prediction using an asset-specific model"
-)
+@app.post("/downlink/predictive_ML/Asset_specific/predict", summary="Run prediction using an asset-specific model")
 async def predict_specific_asset_model(
     payload: PredictSpecificRequest,
+    background_tasks: BackgroundTasks,
     current_user=Depends(auth.get_current_user)
 ):
+    job_id = str(uuid.uuid4())
+    key = f"pred:{job_id}:{payload.model_name}:{payload.asset_id}"
+ 
+    await redis_client.set(key, json.dumps({
+        "status": "queued",
+        "model_name": payload.model_name,
+        "asset_id": payload.asset_id
+    }))
+ 
+    async def _run():
+        try:
+            await redis_client.set(key, json.dumps({"status": "running"}))
+            result = await predict_specific(model_name=payload.model_name, asset_id=payload.asset_id)
+            if result is None:
+                await redis_client.set(key, json.dumps({
+                    "status": "failed",
+                    "error": "No telemetry data found"
+                }))
+                return
+            await redis_client.set(key, json.dumps({
+                "status": "completed",
+                "model_name": payload.model_name,
+                "asset_id": payload.asset_id,
+                "result": result
+            }))
+        except Exception as e:
+            logging.error(f"Asset-specific predict job failed: {e}", exc_info=True)
+            await redis_client.set(key, json.dumps({"status": "failed", "error": str(e)}))
+ 
+    background_tasks.add_task(_run)
+    return {
+        "status": "accepted",
+        "job_id": job_id,
+        "job_key": key,
+        "message": "Asset-specific prediction started in background"
+    }
+   
+######################################################################
+# List stored job IDs
+######################################################################
+
+@app.get("/downlink/predictive_ML/jobs/train", summary="List all stored train job IDs")
+async def list_train_jobs(current_user=Depends(auth.get_current_user)):
     try:
-        result = await predict_specific(
-            model_name=payload.model_name,
-            asset_id=payload.asset_id
-        )
-
-        if result is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Prediction failed. No telemetry data found."
-            )
-
-        return result
-
-    except HTTPException:
-        raise
-
+        keys = await redis_client.keys("train:*")
+        jobs = []
+        for key in keys:
+            data_json = await redis_client.get(key)
+            if data_json:
+                data = json.loads(data_json)
+                # key format: train:{job_id}:{model_name}:{target_column}
+                _, job_id, model_name, target_column = key.split(":", 3)
+                jobs.append({
+                    "job_id": job_id,
+                    "job_key": key,
+                    "model_name": model_name,
+                    "target_column": target_column,
+                    "status": data.get("status"),
+                })
+        return {"status": "success", "count": len(jobs), "jobs": jobs}
     except Exception as e:
-        logging.error(f"Asset-specific prediction API failed: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail="Asset-specific prediction failed"
-        )
-        
+        logging.error(f"Failed to list train jobs: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list train jobs")
+
+
+@app.get("/downlink/predictive_ML/jobs/pred", summary="List all stored prediction job IDs")
+async def list_pred_jobs(current_user=Depends(auth.get_current_user)):
+    try:
+        keys = await redis_client.keys("pred:*")
+        jobs = []
+        for key in keys:
+            data_json = await redis_client.get(key)
+            if data_json:
+                data = json.loads(data_json)
+                # key format: pred:{job_id}:{model_name}:{asset_id}
+                _, job_id, model_name, asset_id = key.split(":", 3)
+                jobs.append({
+                    "job_id": job_id,
+                    "job_key": key,
+                    "model_name": model_name,
+                    "asset_id": asset_id,
+                    "status": data.get("status"),
+                })
+        return {"status": "success", "count": len(jobs), "jobs": jobs}
+    except Exception as e:
+        logging.error(f"Failed to list pred jobs: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list pred jobs")
+
+    
 ###############################################################################
 # store the preditions for future use in visullisation
 ###############################################################################
@@ -2706,25 +2830,21 @@ async def get_closed_notifications_with_remarks(
     except Exception as e:
         logging.error(f"Failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to fetch")
-    
-@app.websocket("/downlink/ws/notifications/{status}")
-async def websocket_notifications_by_status(
-    websocket: WebSocket,
-    status: str 
-):
-    await websocket.accept()
 
-    db = database.SessionLocal()  
+@app.websocket("/downlink/ws/notifications/{status}")
+async def websocket_notifications_by_status(websocket: WebSocket, status: str):
+    await websocket.accept()
 
     try:
         while True:
-            data = (
-                db.query(Notification)
-                .filter(Notification.status == status.upper())
-                .order_by(Notification.edgex_created.desc())
-                .limit(10)
-                .all()
-            )
+            with database.SessionLocal() as db:
+                data = (
+                    db.query(Notification)
+                    .filter(Notification.status == status.upper())
+                    .order_by(Notification.edgex_created.desc())
+                    .limit(10)
+                    .all()
+                )
 
             await websocket.send_json({
                 "status": "success",
@@ -2732,11 +2852,7 @@ async def websocket_notifications_by_status(
                 "data": jsonable_encoder(data)
             })
 
-            # wait before sending again (polling style)
             await asyncio.sleep(10)
 
     except WebSocketDisconnect:
         pass
-
-    finally:
-        db.close()
