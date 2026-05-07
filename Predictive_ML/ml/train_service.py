@@ -2,6 +2,7 @@ import pandas as pd
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any
+from itertools import combinations
 from Predictive_ML.ml.trainers.random_forest import train_random_forest
 from Predictive_ML.ml.model_store import store_model
 from Predictive_ML.pre_trained_models import label_motor_faults
@@ -44,6 +45,18 @@ EQUIPMENT_LABELERS = {
     # "centrifugal_pump": label_pump_faults,
     # "compressor": label_compressor_faults
 }
+
+EQUIPMENT_FAULT_LABELS = {
+    "Slipring Induction motor 60kw": {
+        0: "Healthy",
+        1: "Overload",
+        2: "Rotor/Slipring Fault",
+        3: "Stator Fault",
+        4: "Mechanical Fault"
+    }
+}
+
+USER_DEFINED_FAULT_LABELS = {0: "Normal", 1: "Pre-failure", 2: "Failure"}
 
 def resolve_window_status(status_series):
     if "NOT_WORKING" in status_series.values:
@@ -213,11 +226,59 @@ class TrainService:
         if "status" in df.columns:
             df = df[df["status"] == "OK"]
 
-        # 🔹 Feature columns
+        # 🔹 Feature columns (excludes target but keeps all other sensors)
         feature_cols = [
             col for col in df.columns
             if col not in ["window_start", "status", target_column]
         ]
+
+        # 🔹 Pairwise rolling correlation features
+        # For fault prediction: base = feature_cols (label excluded, all sensors present)
+        # For sensor prediction: correlations are computed across ALL sensor columns
+        # including the target sensor, so cross-correlations like
+        # corr_Vibration__Temperature are not lost when Vibration is the target.
+        # includes target sensor for sensor prediction so cross-correlations
+        # like corr_Vibration__Temperature are not lost when Vibration is the target
+        corr_source_cols = [
+            col for col in df.columns
+            if col not in ["window_start", "status", "label"]
+        ]
+
+        for col_a, col_b in combinations(corr_source_cols, 2):
+            corr_col = f"corr_{col_a}__{col_b}"
+            df[corr_col] = df[col_a].rolling(5, min_periods=2).corr(df[col_b])
+            feature_cols.append(corr_col)
+        df = df.dropna(subset=[c for c in feature_cols if c.startswith("corr_")])
+
+        # Sensor correlation matrix on raw values before scaling — for frontend heatmap
+        sensor_corr_df = df[corr_source_cols].corr().round(3)
+        sensor_correlation = {
+            "columns": corr_source_cols,
+            "matrix": sensor_corr_df.values.tolist()
+        }
+
+        # Label / target info
+        if prediction_type == "fault":
+            label_counts = df["label"].value_counts().sort_index()
+            label_info = {
+                "distribution": {
+                    USER_DEFINED_FAULT_LABELS.get(int(k), str(k)): int(v)
+                    for k, v in label_counts.items()
+                },
+                "total": int(len(df)),
+                "imbalance_warning": bool(label_counts.max() / label_counts.sum() > 0.8)
+            }
+        else:
+            label_info = {
+                "target": target_column,
+                "stats": {
+                    "mean": round(float(df[target_column].mean()), 4),
+                    "std": round(float(df[target_column].std()), 4),
+                    "min": round(float(df[target_column].min()), 4),
+                    "max": round(float(df[target_column].max()), 4),
+                }
+            }
+
         scaler = StandardScaler()
         df[feature_cols] = scaler.fit_transform(df[feature_cols])
         # =========================================================
@@ -303,7 +364,8 @@ class TrainService:
             "prediction_type": prediction_type,
             "freq_minutes": freq_minutes,
             "rows": len(df),
-            "features": features_used
+            "features": features_used,
+            "correlation_pairs": [[a, b] for a, b in combinations(corr_source_cols, 2)]
         }
 
         #  Extra metadata for LSTM
@@ -320,7 +382,9 @@ class TrainService:
         return {
             "model_name": model_name,
             "metrics": metrics,
-            "metadata": metadata
+            "metadata": metadata,
+            "sensor_correlation": sensor_correlation,
+            "label_info": label_info
         }
 
 
@@ -371,6 +435,31 @@ class TrainService:
             col for col in df.columns
             if col not in ["window_start", "status", target_column]
         ]
+
+        corr_source_cols = [
+            col for col in df.columns
+            if col not in ["window_start", "status", "label"]
+        ]
+
+        # Sensor correlation matrix on raw values before scaling — for frontend heatmap
+        sensor_corr_df = df[corr_source_cols].corr().round(3)
+        sensor_correlation = {
+            "columns": corr_source_cols,
+            "matrix": sensor_corr_df.values.tolist()
+        }
+
+        # Label distribution with equipment-specific class names
+        label_counts = df["label"].value_counts().sort_index()
+        _fault_labels = EQUIPMENT_FAULT_LABELS.get(equipment_type, {})
+        label_info = {
+            "distribution": {
+                _fault_labels.get(int(k), f"Class {k}"): int(v)
+                for k, v in label_counts.items()
+            },
+            "total": int(len(df)),
+            "imbalance_warning": bool(label_counts.max() / label_counts.sum() > 0.8)
+        }
+
         scaler = StandardScaler()
         df[feature_cols] = scaler.fit_transform(df[feature_cols])
         # =========================================================
@@ -475,7 +564,9 @@ class TrainService:
         return {
             "model_name": model_name,
             "metrics": metrics,
-            "metadata": metadata
+            "metadata": metadata,
+            "sensor_correlation": sensor_correlation,
+            "label_info": label_info
         }
 
     @staticmethod
@@ -492,11 +583,32 @@ class TrainService:
         df = covert_csv_to_dataframe(df)
         df = df.sort_values("window_start")
 
+        # 🔹 Recompute correlation features used during training
+        corr_pairs = metadata.get("correlation_pairs", [])
+        for col_a, col_b in corr_pairs:
+            corr_col = f"corr_{col_a}__{col_b}"
+            df[corr_col] = df[col_a].rolling(5, min_periods=2).corr(df[col_b]).fillna(0)
+
+        # Live sensor correlation from the incoming data window
+        live_sensor_cols = [
+            c for c in df.columns
+            if not c.startswith("corr_") and c not in ["window_start", "status", "label"]
+        ]
+        live_corr = df[live_sensor_cols].corr().round(3)
+        sensor_correlation = {
+            "columns": live_sensor_cols,
+            "matrix": live_corr.values.tolist(),
+            "data_points": len(df)
+        }
+
         expected_features = metadata.get("features", [])
         horizon = metadata.get("horizon")
         freq_minutes = freq_minutes_override if freq_minutes_override is not None else metadata.get("freq_minutes", 5)
         algorithm = metadata.get("algorithm")
         prediction_type = metadata.get("prediction_type")
+        fault_labels = EQUIPMENT_FAULT_LABELS.get(metadata.get("equipment_type"), USER_DEFINED_FAULT_LABELS)
+        predicted_label = None
+        named_probs = None
 
         # 🔹 Validate features
         missing_features = [
@@ -546,9 +658,13 @@ class TrainService:
                 logits = torch.tensor(output)
                 class_probs = torch.softmax(logits, dim=0).numpy().tolist()
                 predicted_class = int(np.argmax(class_probs))
-                values = [predicted_class]
-                probs = [class_probs]
-                confidence = [max(class_probs)]
+                # replicate across all steps — LSTM answers "worst state in horizon",
+                # not a per-step prediction, so every timestamp gets the same class
+                values = [predicted_class] * steps
+                probs = [class_probs] * steps
+                confidence = [max(class_probs)] * steps
+                predicted_label = fault_labels.get(predicted_class, str(predicted_class))
+                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(class_probs)}
 
                 # confusion matrix on historical labeled sequences
                 cm = None
@@ -586,6 +702,9 @@ class TrainService:
                 "probabilities": probs,
                 "confidence": confidence,
                 "confusion_matrix": cm,
+                "sensor_correlation": sensor_correlation,
+                "predicted_label": predicted_label,
+                "named_probabilities": named_probs,
                 "meta": {
                     "type": prediction_type,
                     "mode": "multi_step",
@@ -615,7 +734,6 @@ class TrainService:
                 for i in range(steps)
             ]
 
-            # 🔹 Expand prediction
             values = [y_pred[0]] * steps
 
             # 🔹 Fault
@@ -623,6 +741,8 @@ class TrainService:
                 base_prob = y_prob[0]
                 probs = [base_prob.tolist()] * steps
                 confidence = [max(base_prob)] * steps
+                predicted_label = fault_labels.get(int(values[0]), str(int(values[0])))
+                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(base_prob)}
             else:
                 probs = None
                 confidence = [1.0] * steps
@@ -644,6 +764,9 @@ class TrainService:
                 "probabilities": probs,
                 "confidence": confidence,
                 "confusion_matrix": cm,
+                "sensor_correlation": sensor_correlation,
+                "predicted_label": predicted_label,
+                "named_probabilities": named_probs,
                 "meta": {
                     "type": prediction_type,
                     "mode": "single_step",
@@ -663,11 +786,32 @@ class TrainService:
 
         df = df.sort_values("window_start")
 
+        # 🔹 Recompute correlation features used during training
+        corr_pairs = metadata.get("correlation_pairs", [])
+        for col_a, col_b in corr_pairs:
+            corr_col = f"corr_{col_a}__{col_b}"
+            df[corr_col] = df[col_a].rolling(5, min_periods=2).corr(df[col_b]).fillna(0)
+
+        # Live sensor correlation from the incoming data window
+        live_sensor_cols = [
+            c for c in df.columns
+            if not c.startswith("corr_") and c not in ["window_start", "status", "label"]
+        ]
+        live_corr = df[live_sensor_cols].corr().round(3)
+        sensor_correlation = {
+            "columns": live_sensor_cols,
+            "matrix": live_corr.values.tolist(),
+            "data_points": len(df)
+        }
+
         expected_features = metadata.get("features", [])
         horizon = metadata.get("horizon")
         freq_minutes = freq_minutes_override if freq_minutes_override is not None else metadata.get("freq_minutes", 5)
         algorithm = metadata.get("algorithm")
         prediction_type = metadata.get("prediction_type")
+        fault_labels = EQUIPMENT_FAULT_LABELS.get(metadata.get("equipment_type"), USER_DEFINED_FAULT_LABELS)
+        predicted_label = None
+        named_probs = None
 
         # 🔹 Validate features
         missing_features = [
@@ -716,9 +860,13 @@ class TrainService:
                 logits = torch.tensor(output)
                 class_probs = torch.softmax(logits, dim=0).numpy().tolist()
                 predicted_class = int(np.argmax(class_probs))
-                values = [predicted_class]
-                probs = [class_probs]
-                confidence = [max(class_probs)]
+                # replicate across all steps — LSTM answers "worst state in horizon",
+                # not a per-step prediction, so every timestamp gets the same class
+                values = [predicted_class] * steps
+                probs = [class_probs] * steps
+                confidence = [max(class_probs)] * steps
+                predicted_label = fault_labels.get(predicted_class, str(predicted_class))
+                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(class_probs)}
 
                 # confusion matrix on historical labeled sequences
                 cm = None
@@ -754,6 +902,9 @@ class TrainService:
                 "probabilities": probs,
                 "confidence": confidence,
                 "confusion_matrix": cm,
+                "sensor_correlation": sensor_correlation,
+                "predicted_label": predicted_label,
+                "named_probabilities": named_probs,
                 "meta": {
                     "type": prediction_type,
                     "mode": "multi_step",
@@ -789,6 +940,8 @@ class TrainService:
                 base_prob = y_prob[0]
                 probs = [base_prob.tolist()] * steps
                 confidence = [max(base_prob)] * steps
+                predicted_label = fault_labels.get(int(values[0]), str(int(values[0])))
+                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(base_prob)}
             else:
                 probs = None
                 confidence = [1.0] * steps
@@ -810,6 +963,9 @@ class TrainService:
                 "probabilities": probs,
                 "confidence": confidence,
                 "confusion_matrix": cm,
+                "sensor_correlation": sensor_correlation,
+                "predicted_label": predicted_label,
+                "named_probabilities": named_probs,
                 "meta": {
                     "type": prediction_type,
                     "mode": "single_step",
