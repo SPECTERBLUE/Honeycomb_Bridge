@@ -12,6 +12,7 @@ from Predictive_ML.ml.trainers.lstm import train_lstm
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 import torch
+from collections import Counter
 
 #  Device selection (GPU if available, else CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -27,7 +28,7 @@ def create_sequences(df, feature_cols, target_col, seq_length, horizon_steps, pr
 
         if prediction_type == "fault":
             future = df.iloc[i+seq_length:i+seq_length+horizon_steps][target_col]
-            seq_y = int(future.max())  # 0=normal, 1=pre-failure, 2=failure
+            seq_y = int(df.iloc[i + seq_length + horizon_steps - 1][target_col])
 
         else:  # sensor
             seq_y = df.iloc[
@@ -302,7 +303,11 @@ class TrainService:
 
             if len(X_seq) == 0:
                 raise ValueError("Not enough data to create sequences")
-
+            
+            if prediction_type == "fault":
+                print("=== SEQUENCE LABEL DIST ===")
+                print(Counter(y_seq.tolist()))
+                
             num_classes = int(np.max(y_seq)) + 1 if prediction_type == "fault" else None
 
             split_idx = int(len(X_seq) * 0.8)
@@ -338,16 +343,21 @@ class TrainService:
                 drop_cols.append("status")
 
             X = df.drop(columns=drop_cols)
-            y = df[target_column]
+            y = df[target_column].astype(int)
+            
+            print(y.value_counts(normalize=True).sort_index())
 
             if algorithm == "random_forest":
                 model, metrics = train_random_forest(
-                    X, y, test_size=test_size, random_state=random_state
+                    X, y, test_size=test_size, random_state=random_state,
+                    class_weight="balanced"
                 )
 
             elif algorithm == "xgboost":
+                counts = y.value_counts()
+                scale = float(counts.get(0, 1)) / float(counts.get(1, 1))
                 model, metrics = train_xgboost(
-                    X, y, test_size=test_size, random_state=random_state
+                    X, y, test_size=test_size, random_state=random_state, scale_pos_weight=scale
                 )
 
             else:
@@ -423,10 +433,14 @@ class TrainService:
 
         label_function = EQUIPMENT_LABELERS[equipment_type]
         df = label_function(df, thresholds)
+        
+        print("=== LABELS AFTER label_motor_faults ===")
+        print(df["label"].value_counts().sort_index())
 
         df = df.sort_values("window_start")
 
         steps = horizon_to_steps(horizon, freq_minutes)
+        print(f"=== STEPS: {steps}, HORIZON: {horizon}, FREQ: {freq_minutes} ===")
 
         prediction_type = "sensor" if target_column != "label" else "fault"
 
@@ -436,7 +450,9 @@ class TrainService:
         if "status" in df.columns:
             df = df[df["status"] == "OK"]
 
-        # 🔹 Feature columns
+        # =========================================================
+        # 🔹 FEATURE COLUMNS
+        # =========================================================
         feature_cols = [
             col for col in df.columns
             if col not in ["window_start", "status", target_column]
@@ -454,23 +470,45 @@ class TrainService:
             "matrix": sensor_corr_df.values.tolist()
         }
 
-        # Label distribution with equipment-specific class names
+        # =========================================================
+        # 🔹 LABEL INFO
+        # =========================================================
         label_counts = df["label"].value_counts().sort_index()
-        _fault_labels = EQUIPMENT_FAULT_LABELS.get(equipment_type, {})
+
+        _fault_labels = EQUIPMENT_FAULT_LABELS.get(
+            equipment_type,
+            {}
+        )
+
         label_info = {
             "distribution": {
                 _fault_labels.get(int(k), f"Class {k}"): int(v)
                 for k, v in label_counts.items()
             },
             "total": int(len(df)),
-            "imbalance_warning": bool(label_counts.max() / label_counts.sum() > 0.8)
+            "imbalance_warning": bool(
+                label_counts.max() / label_counts.sum() > 0.8
+            )
         }
 
-        df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan)
+        # =========================================================
+        # 🔹 CLEAN NAN/INF
+        # =========================================================
+        df[feature_cols] = df[feature_cols].replace(
+            [np.inf, -np.inf],
+            np.nan
+        )
+
         df = df.dropna(subset=feature_cols)
 
+        # =========================================================
+        # 🔹 SCALE
+        # =========================================================
         scaler = StandardScaler()
-        df[feature_cols] = scaler.fit_transform(df[feature_cols])
+
+        df[feature_cols] = scaler.fit_transform(
+            df[feature_cols]
+        )
         # =========================================================
         # LSTM (SEQUENCE MODEL)
         # =========================================================
@@ -490,6 +528,9 @@ class TrainService:
 
             if len(X_seq) == 0:
                 raise ValueError("Not enough data to create sequences")
+            
+            if prediction_type == "fault":
+                print(Counter(y_seq.tolist()))
 
             num_classes = int(np.max(y_seq)) + 1 if prediction_type == "fault" else None
 
@@ -516,34 +557,84 @@ class TrainService:
         else:
 
             if prediction_type == "sensor":
-                raise ValueError(f"{algorithm} does not support sensor prediction. Use lstm instead.")
+                raise ValueError(
+                    f"{algorithm} does not support sensor prediction. Use lstm instead."
+                )
 
-            # 🔹 create FUTURE label (ONLY for tabular models)
+            # 🔹 create FUTURE label
             df[target_column] = df[target_column].shift(-steps)
+
             df = df.dropna(subset=[target_column])
 
+            # 🔹 IMPORTANT
+            df[target_column] = df[target_column].astype(int)
+
             drop_cols = [target_column, "window_start"]
+
             if "status" in df.columns:
                 drop_cols.append("status")
 
             X = df.drop(columns=drop_cols)
-            y = df[target_column]
+            y = df[target_column].astype(int)
 
+            print("=== LABEL DIST (after shift) ===")
+            print(y.value_counts().sort_index())
+
+            print("=== UNIQUE CLASSES ===")
+            print(sorted(np.unique(y)))
+
+            # =====================================================
+            # RANDOM FOREST
+            # =====================================================
             if algorithm == "random_forest":
+
                 model, metrics = train_random_forest(
-                    X, y, test_size=test_size, random_state=random_state
+                    X,
+                    y,
+                    test_size=test_size,
+                    random_state=random_state,
+                    class_weight="balanced"
                 )
 
+            # =====================================================
+            # XGBOOST
+            # =====================================================
             elif algorithm == "xgboost":
-                model, metrics = train_xgboost(
-                    X, y, test_size=test_size, random_state=random_state
-                )
+
+                num_classes = len(np.unique(y))
+
+                # 🔹 MULTICLASS
+                if num_classes > 2:
+
+                    model, metrics = train_xgboost(
+                        X,
+                        y,
+                        test_size=test_size,
+                        random_state=random_state,
+                        objective="multi:softprob",
+                        num_class=num_classes,
+                        eval_metric="mlogloss"
+                    )
+
+                # 🔹 BINARY
+                else:
+
+                    counts = y.value_counts()
+
+                    scale = float(counts.get(0, 1)) / float(counts.get(1, 1))
+
+                    model, metrics = train_xgboost(
+                        X,
+                        y,
+                        test_size=test_size,
+                        random_state=random_state,
+                        scale_pos_weight=scale
+                    )
 
             else:
                 raise ValueError(f"Unsupported algorithm: {algorithm}")
 
             features_used = list(X.columns)
-
         # =========================================================
         # 🔹 MODEL METADATA
         # =========================================================
@@ -666,18 +757,38 @@ class TrainService:
                 for i in range(steps)
             ]
 
-            # 🔹 Fault
+            # 🔹 Fault — sliding window: step 0 uses freshest context, step N uses older context
             if prediction_type == "fault":
-                logits = torch.tensor(output)
-                class_probs = torch.softmax(logits, dim=0).numpy().tolist()
-                predicted_class = int(np.argmax(class_probs))
-                # replicate across all steps — LSTM answers "worst state in horizon",
-                # not a per-step prediction, so every timestamp gets the same class
-                values = [predicted_class] * steps
-                probs = [class_probs] * steps
-                confidence = [max(class_probs)] * steps
-                predicted_label = fault_labels.get(predicted_class, str(predicted_class))
-                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(class_probs)}
+                per_step_values = []
+                per_step_probs = []
+                per_step_conf = []
+
+                for step_i in range(steps):
+                    if step_i == 0:
+                        win_df = df.iloc[-seq_len:][expected_features]
+                    elif len(df) >= seq_len + step_i:
+                        win_df = df.iloc[-(seq_len + step_i):-step_i][expected_features]
+                    else:
+                        win_df = df.iloc[-seq_len:][expected_features]
+
+                    win_df = win_df.replace([np.inf, -np.inf], np.nan).fillna(0)
+                    win_seq = scaler.transform(win_df) if scaler is not None else win_df.values
+
+                    X_i = torch.tensor(win_seq, dtype=torch.float32).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        out_i = model(X_i).cpu().numpy().flatten()
+                        out_i = np.nan_to_num(out_i, nan=0.0, posinf=1.0, neginf=-1.0)
+
+                    probs_i = torch.softmax(torch.tensor(out_i), dim=0).numpy().tolist()
+                    per_step_values.append(int(np.argmax(probs_i)))
+                    per_step_probs.append(probs_i)
+                    per_step_conf.append(float(max(probs_i)))
+
+                values = per_step_values
+                probs = per_step_probs
+                confidence = per_step_conf
+                predicted_label = fault_labels.get(values[-1], str(values[-1]))
+                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(per_step_probs[-1])}
 
                 # confusion matrix on historical labeled sequences
                 cm = None
@@ -739,32 +850,33 @@ class TrainService:
         # =========================================================
         else:
 
-            latest_row = df.iloc[-1:]
-            X = latest_row[expected_features]
-
-            y_pred = model.predict(X)
-
-            if hasattr(model, "predict_proba"):
-                y_prob = model.predict_proba(X)
-            else:
-                y_prob = None
-
-            timestamp = latest_row["window_start"].iloc[0]
-
+            base_ts = df["window_start"].iloc[-1]
             timestamps = [
-                timestamp + (i + 1) * freq_minutes * 60
+                base_ts + (i + 1) * freq_minutes * 60
                 for i in range(steps)
             ]
 
-            values = [y_pred[0]] * steps
+            # Row at T-(steps-1) predicts T+1, row at T-(steps-2) predicts T+2, ..., row at T predicts T+steps
+            n = min(steps, len(df))
+            predict_rows = df.iloc[-n:][expected_features]
+            y_preds_all = model.predict(predict_rows)
+            y_probs_all = model.predict_proba(predict_rows) if hasattr(model, "predict_proba") else None
 
-            # 🔹 Fault
-            if prediction_type == "fault" and y_prob is not None:
-                base_prob = y_prob[0]
-                probs = [base_prob.tolist()] * steps
-                confidence = [max(base_prob)] * steps
-                predicted_label = fault_labels.get(int(values[0]), str(int(values[0])))
-                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(base_prob)}
+            if n < steps:
+                pad = steps - n
+                y_preds_full = [int(y_preds_all[0])] * pad + [int(v) for v in y_preds_all]
+                y_probs_full = ([y_probs_all[0].tolist()] * pad + [p.tolist() for p in y_probs_all]) if y_probs_all is not None else None
+            else:
+                y_preds_full = [int(v) for v in y_preds_all]
+                y_probs_full = [p.tolist() for p in y_probs_all] if y_probs_all is not None else None
+
+            values = y_preds_full
+
+            if prediction_type == "fault" and y_probs_full is not None:
+                probs = y_probs_full
+                confidence = [max(p) for p in y_probs_full]
+                predicted_label = fault_labels.get(values[-1], str(values[-1]))
+                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(y_probs_full[-1])}
             else:
                 probs = None
                 confidence = None
@@ -879,17 +991,38 @@ class TrainService:
                 for i in range(steps)
             ]
 
+            # 🔹 Fault — sliding window: step 0 uses freshest context, step N uses older context
             if prediction_type == "fault":
-                logits = torch.tensor(output)
-                class_probs = torch.softmax(logits, dim=0).numpy().tolist()
-                predicted_class = int(np.argmax(class_probs))
-                # replicate across all steps — LSTM answers "worst state in horizon",
-                # not a per-step prediction, so every timestamp gets the same class
-                values = [predicted_class] * steps
-                probs = [class_probs] * steps
-                confidence = [max(class_probs)] * steps
-                predicted_label = fault_labels.get(predicted_class, str(predicted_class))
-                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(class_probs)}
+                per_step_values = []
+                per_step_probs = []
+                per_step_conf = []
+
+                for step_i in range(steps):
+                    if step_i == 0:
+                        win_df = df.iloc[-seq_len:][expected_features]
+                    elif len(df) >= seq_len + step_i:
+                        win_df = df.iloc[-(seq_len + step_i):-step_i][expected_features]
+                    else:
+                        win_df = df.iloc[-seq_len:][expected_features]
+
+                    win_df = win_df.replace([np.inf, -np.inf], np.nan).fillna(0)
+                    win_seq = scaler.transform(win_df) if scaler is not None else win_df.values
+
+                    X_i = torch.tensor(win_seq, dtype=torch.float32).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        out_i = model(X_i).cpu().numpy().flatten()
+                        out_i = np.nan_to_num(out_i, nan=0.0, posinf=1.0, neginf=-1.0)
+
+                    probs_i = torch.softmax(torch.tensor(out_i), dim=0).numpy().tolist()
+                    per_step_values.append(int(np.argmax(probs_i)))
+                    per_step_probs.append(probs_i)
+                    per_step_conf.append(float(max(probs_i)))
+
+                values = per_step_values
+                probs = per_step_probs
+                confidence = per_step_conf
+                predicted_label = fault_labels.get(values[-1], str(values[-1]))
+                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(per_step_probs[-1])}
 
                 # confusion matrix on historical labeled sequences
                 cm = None
@@ -949,31 +1082,33 @@ class TrainService:
         # =========================================================
         else:
 
-            latest_row = df.iloc[-1:]
-            X = latest_row[expected_features]
-
-            y_pred = model.predict(X)
-
-            if hasattr(model, "predict_proba"):
-                y_prob = model.predict_proba(X)
-            else:
-                y_prob = None
-
-            timestamp = latest_row["window_start"].iloc[0]
-
+            base_ts = df["window_start"].iloc[-1]
             timestamps = [
-                timestamp + (i + 1) * freq_minutes * 60
+                base_ts + (i + 1) * freq_minutes * 60
                 for i in range(steps)
             ]
 
-            values = [y_pred[0]] * steps
+            # Row at T-(steps-1) predicts T+1, row at T-(steps-2) predicts T+2, ..., row at T predicts T+steps
+            n = min(steps, len(df))
+            predict_rows = df.iloc[-n:][expected_features]
+            y_preds_all = model.predict(predict_rows)
+            y_probs_all = model.predict_proba(predict_rows) if hasattr(model, "predict_proba") else None
 
-            if prediction_type == "fault" and y_prob is not None:
-                base_prob = y_prob[0]
-                probs = [base_prob.tolist()] * steps
-                confidence = [max(base_prob)] * steps
-                predicted_label = fault_labels.get(int(values[0]), str(int(values[0])))
-                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(base_prob)}
+            if n < steps:
+                pad = steps - n
+                y_preds_full = [int(y_preds_all[0])] * pad + [int(v) for v in y_preds_all]
+                y_probs_full = ([y_probs_all[0].tolist()] * pad + [p.tolist() for p in y_probs_all]) if y_probs_all is not None else None
+            else:
+                y_preds_full = [int(v) for v in y_preds_all]
+                y_probs_full = [p.tolist() for p in y_probs_all] if y_probs_all is not None else None
+
+            values = y_preds_full
+
+            if prediction_type == "fault" and y_probs_full is not None:
+                probs = y_probs_full
+                confidence = [max(p) for p in y_probs_full]
+                predicted_label = fault_labels.get(values[-1], str(values[-1]))
+                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(y_probs_full[-1])}
             else:
                 probs = None
                 confidence = None
