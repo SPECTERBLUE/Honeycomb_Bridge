@@ -39,6 +39,7 @@ import re
 import uuid
 import threading
 import asyncio
+import torch
 from fastapi import Query
 from fastapi.encoders import jsonable_encoder
 from Notifications.worker import run_notification_worker
@@ -3118,3 +3119,33 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
         "chirpstack_token": config.API_TOKEN,
         "failed_attempts_before_login": prior_fails
     }
+    
+# check GPU specifications and availability for LSTM training
+@app.get("/downlink/predictive_ML/lstm/gpu-info", summary="Get GPU information for LSTM training")
+async def get_gpu_info(current_user=Depends(auth.get_current_user)):
+    try:
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            gpu_info = []
+            for i in range(gpu_count):
+                gpu_info.append({
+                    "name": torch.cuda.get_device_name(i),
+                    "total_memory": torch.cuda.get_device_properties(i).total_memory,
+                    "available_memory": torch.cuda.memory_allocated(i),
+                    "free_memory": torch.cuda.memory_reserved(i) - torch.cuda.memory_allocated(i)
+                })
+            return {
+                "status": "success",
+                "gpu_available": True,
+                "gpu_count": gpu_count,
+                "gpu_info": gpu_info
+            }
+        else:
+            return {
+                "status": "success",
+                "gpu_available": False,
+                "message": "No GPU available, training will use CPU which may be slower."
+            }
+    except Exception as e:
+        logging.error(f"Failed to get GPU info: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get GPU information")
