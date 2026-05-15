@@ -6,7 +6,8 @@ def train_random_forest(
     X,
     y,
     test_size: float = 0.2,
-    random_state: int = 42
+    random_state: int = 42,
+    class_weight: str = "balanced"
 ):
     """
     Trains Random Forest for both classification & regression
@@ -20,7 +21,8 @@ def train_random_forest(
         n_estimators=300,
         max_depth=12,
         random_state=random_state,
-        n_jobs=-1
+        n_jobs=-1,
+        class_weight="balanced"
     )
 
     model.fit(X_train, y_train)

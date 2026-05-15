@@ -39,6 +39,7 @@ import re
 import uuid
 import threading
 import asyncio
+import torch
 from fastapi import Query
 from fastapi.encoders import jsonable_encoder
 from Notifications.worker import run_notification_worker
@@ -46,6 +47,7 @@ from Notifications.db_notification.models import Notification, NotificationActio
 from Notifications.schema import CloseNotificationRequest, NotificationResponse
 from Notifications.db_notification.crud import get_notifications, get_last_notification_timestamp, close_notification, get_notifications_by_status
 from captcha_utils import (
+    encrypt_aes_gcm_downlink_login,
     redis_client,
     generate_captcha_text,
     encrypt_aes_gcm,
@@ -2867,3 +2869,283 @@ async def websocket_notifications_by_status(websocket: WebSocket, status: str):
 
     except WebSocketDisconnect:
         pass
+    
+###############################################################################################################################
+# Consolidating the auth for honeycomb
+################################################################################################################################
+LOGIN_MAX_ATTEMPTS = 3
+LOGIN_LOCKOUT_TTL = 900  # 15 minutes in seconds
+
+
+async def _record_login_failure(username: str) -> dict:
+    fail_key = f"login_fails:{username}"
+    lock_key = f"login_lock:{username}"
+    fails = int(await redis_client.incr(fail_key))
+    if fails == 1:
+        await redis_client.expire(fail_key, LOGIN_LOCKOUT_TTL)
+    if fails >= LOGIN_MAX_ATTEMPTS:
+        await redis_client.setex(lock_key, LOGIN_LOCKOUT_TTL, "locked")
+        await redis_client.delete(fail_key)
+        return {
+            "locked": True,
+            "failed_attempts": LOGIN_MAX_ATTEMPTS,
+            "lockout_seconds": LOGIN_LOCKOUT_TTL,
+        }
+    return {
+        "locked": False,
+        "failed_attempts": fails,
+        "attempts_remaining": LOGIN_MAX_ATTEMPTS - fails,
+    }
+    
+class HoneycombAuthRequest(BaseModel):
+    captcha_id: str
+    encrypted_input: dict  # { "iv": ..., "ciphertext": ..., "tag": ... }
+    identity: dict
+    secret: dict
+    mfa_code: Optional[str] = None
+    
+_RATE_LIMIT_IP_MAX = 10        # max attempts per IP per window
+_RATE_LIMIT_WINDOW = 60        # seconds
+
+async def _check_rate_limit(redis, key: str, max_attempts: int):
+    """Increment counter and set TTL on first hit. Returns (count, ttl)."""
+    count = await redis.incr(key)
+    if count == 1:
+        await redis.expire(key, _RATE_LIMIT_WINDOW)
+    ttl = await redis.ttl(key)
+    return count, ttl
+
+
+@app.post("/downlink/auth/honeycomb", summary="Authenticate with Honeycomb using encrypted credentials and MFA")
+async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: Session = Depends(get_db)):
+
+    # Resolve real client IP (works behind nginx/reverse proxy)
+    forwarded_for = http_request.headers.get("X-Forwarded-For")
+    client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else http_request.client.host
+
+    # Per-IP rate limit
+    ip_count, ip_ttl = await _check_rate_limit(redis_client, f"rate:auth:ip:{client_ip}", _RATE_LIMIT_IP_MAX)
+    if ip_count > _RATE_LIMIT_IP_MAX:
+        raise HTTPException(status_code=429, detail=f"Too many requests from your IP. Try again in {ip_ttl} seconds.")
+
+    request = body
+
+    # 1. Verify captcha
+    stored_captcha = await redis_client.get(request.captcha_id)
+    try:
+        decrypted_input = decrypt_aes_gcm(request.encrypted_input)
+    except Exception:
+        await redis_client.delete(request.captcha_id)
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid captcha input."})
+
+    if not stored_captcha or stored_captcha != decrypted_input:
+        await redis_client.delete(request.captcha_id)
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Captcha mismatch or null input."})
+
+    await redis_client.delete(request.captcha_id)
+
+    # 2. Decrypt credentials
+    username = decrypt_aes_gcm_downlink_login(request.identity)
+    password = decrypt_aes_gcm_downlink_login(request.secret)
+    if not username or not password:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid encrypted credentials")
+
+    # 3. Check lockout
+    lock_key = f"login_lock:{username}"
+    if await redis_client.get(lock_key):
+        ttl = max(int(await redis_client.ttl(lock_key)), 0)
+        return JSONResponse(status_code=429, content={
+            "status": "error",
+            "message": "Account temporarily locked due to too many failed login attempts.",
+            "lockout_seconds_remaining": ttl
+        })
+
+    # 4. Authenticate
+    user = auth.authenticate_user(db, username, password)
+    if not user:
+        info = await _record_login_failure(username)
+        if info["locked"]:
+            return JSONResponse(status_code=429, content={
+                "status": "error",
+                "message": f"Account locked for {LOGIN_LOCKOUT_TTL // 60} minutes due to too many failed login attempts.",
+                "failed_attempts": info["failed_attempts"],
+                "lockout_seconds": info["lockout_seconds"]
+            })
+        return JSONResponse(status_code=401, content={
+            "status": "error",
+            "message": "Invalid credentials. Request a new captcha.",
+            "failed_attempts": info["failed_attempts"],
+            "attempts_remaining": info["attempts_remaining"]
+        })
+
+    # 5. MFA check
+    if user.mfa_secret:
+        if not request.mfa_code:
+            raise HTTPException(status_code=400, detail="MFA code required")
+        totp = pyotp.TOTP(user.mfa_secret)
+        if not totp.verify(request.mfa_code):
+            info = await _record_login_failure(username)
+            if info["locked"]:
+                return JSONResponse(status_code=429, content={
+                    "status": "error",
+                    "message": f"Account locked for {LOGIN_LOCKOUT_TTL // 60} minutes due to too many failed login attempts.",
+                    "failed_attempts": info["failed_attempts"],
+                    "lockout_seconds": info["lockout_seconds"]
+                })
+            return JSONResponse(status_code=401, content={
+                "status": "error",
+                "message": "Invalid MFA code.",
+                "failed_attempts": info["failed_attempts"],
+                "attempts_remaining": info["attempts_remaining"]
+            })
+
+    # Success — read and clear any prior failure counters
+    prior_fails_raw = await redis_client.get(f"login_fails:{username}")
+    prior_fails = int(prior_fails_raw) if prior_fails_raw else 0
+    await redis_client.delete(f"login_fails:{username}")
+    await redis_client.delete(lock_key)
+
+    # 6. Create access token
+    Bridge_access_token = auth.create_access_token(data={"sub": str(user.id)})
+    
+    # 6. Magistrala token generation
+    magistrala_identity = encrypt_aes_gcm_downlink_login(username)  # Re-encrypt for magistrala
+    magistrala_secret = encrypt_aes_gcm_downlink_login(password)  
+    
+    magistrala_token_response = requests.post( 
+        "https://iot.meridiandatalabs.com/users/tokens/issue",
+        json ={ 
+        "identity": magistrala_identity,
+        "secret": magistrala_secret
+    })
+    if magistrala_token_response.status_code != 200:
+        logging.error(f"Failed to get Magistrala token: {magistrala_token_response.text}")
+        raise HTTPException(status_code=500, detail="Failed to authenticate with Magistrala")
+    
+    magistrala_access_token = magistrala_token_response.json().get("data", {}).get("access_token")
+    magistrala_refresh_token = magistrala_token_response.json().get("data", {}).get("refresh_token")
+    
+    # 7. edgex token generation (get token )
+    edgex_user = username.split("@")[0]  
+    logging.info(f"Looking for Edgex token for user: {edgex_user} in token store")
+    if not os.path.exists(JSON_FILE):
+        raise HTTPException(status_code=500, detail="Token store not found.")
+    
+    try:
+        with open(JSON_FILE, "r") as f:
+            data = json.load(f)
+
+        for entry in data:
+            if entry.get("username") == edgex_user:
+                edgex_token = entry.get("token")
+                logging.info(f"Found Edgex token for user: {edgex_user}")
+                break
+        else:
+            raise HTTPException(status_code=404, detail="Edgex token not found for user.")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error reading token store: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error accessing token store.")
+    
+    # 8. get the JWT for edgex using the token and username
+    
+    JWT_responce_edgex = requests.get(
+        f"https://rapid.meridiandatalabs.com/vault/v1/identity/oidc/token/{edgex_user}",
+        headers={"Authorization": f"Bearer {edgex_token}"}
+    )
+    if JWT_responce_edgex.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to get Edgex JWT")
+    
+    edgex_jwt = JWT_responce_edgex.json().get("data", {}).get("token")
+    logging.info(f"Obtained Edgex JWT for user: {edgex_user}")
+    
+    # 9. login for chirpstack and get the token
+    
+    chirpstack_login_response = requests.get(
+        "https://chirp.meridiandatalabs.com/api/tenants",
+        headers={"Authorization": f"Bearer {config.API_TOKEN}"}
+    )
+    
+    # 10. login for superset and get the token
+    
+    superset_username = magistrala_identity
+    superset_password = magistrala_secret
+    
+    # combine {iv,chiphertext and tag into one string with : as separator to send to superset}
+    
+    superset_identity = f"{magistrala_identity['iv']}:{magistrala_identity['ciphertext']}:{magistrala_identity['tag']}"
+    superset_secret = f"{magistrala_secret['iv']}:{magistrala_secret['ciphertext']}:{magistrala_secret['tag']}"
+    
+    superset_login_response = requests.post(
+        "https://superset.meridiandatalabs.com/api/v1/security/login",
+        json={
+            "username": superset_identity,
+            "password": superset_secret,
+            "provider": "db",
+            "refresh": True
+        })
+    if superset_login_response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to authenticate with Superset")
+    
+    superset_access_token = superset_login_response.json().get("access_token")
+    superset_refresh_token = superset_login_response.json().get("refresh_token")
+    
+    # session management and concurrnt session check
+    
+    sesson_management_response = requests.post(
+        "https://iot.meridiandatalabs.com/users/login",
+        json={
+            "identity": magistrala_identity,
+            "password": magistrala_secret
+        }
+    )
+    if sesson_management_response.status_code != 200:
+        logging.error(f"Failed session management check: {sesson_management_response.text}")
+        raise HTTPException(status_code=500, detail="Failed to manage user session")
+    
+    session_token = sesson_management_response.json().get("token")
+    # Return all tokens to frontend
+    return {
+        "status": "success",
+        "bridge_access_token": Bridge_access_token,
+        "magistrala_access_token": magistrala_access_token,
+        "magistrala_refresh_token": magistrala_refresh_token,
+        "edgex_jwt": edgex_jwt,
+        "superset_access_token": superset_access_token,
+        "superset_refresh_token": superset_refresh_token,
+        "session_token": session_token,
+        "chirpstack_token": config.API_TOKEN,
+        "failed_attempts_before_login": prior_fails
+    }
+    
+# check GPU specifications and availability for LSTM training
+@app.get("/downlink/predictive_ML/lstm/gpu-info", summary="Get GPU information for LSTM training")
+async def get_gpu_info(current_user=Depends(auth.get_current_user)):
+    try:
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            gpu_info = []
+            for i in range(gpu_count):
+                gpu_info.append({
+                    "name": torch.cuda.get_device_name(i),
+                    "total_memory": torch.cuda.get_device_properties(i).total_memory,
+                    "available_memory": torch.cuda.memory_allocated(i),
+                    "free_memory": torch.cuda.memory_reserved(i) - torch.cuda.memory_allocated(i)
+                })
+            return {
+                "status": "success",
+                "gpu_available": True,
+                "gpu_count": gpu_count,
+                "gpu_info": gpu_info
+            }
+        else:
+            return {
+                "status": "success",
+                "gpu_available": False,
+                "message": "No GPU available, training will use CPU which may be slower."
+            }
+    except Exception as e:
+        logging.error(f"Failed to get GPU info: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get GPU information")

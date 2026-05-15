@@ -21,7 +21,14 @@ def train_lstm(X, y, prediction_type, device=device, num_classes=None):
     if prediction_type == "fault":
         y = torch.tensor(y, dtype=torch.long)
         output_size = num_classes if num_classes is not None else int(y.max().item()) + 1
-        criterion = nn.CrossEntropyLoss()
+        from collections import Counter
+        counts = Counter(y.tolist())
+        total = len(y)
+        weights = torch.tensor(
+            [total / (output_size * counts.get(i, 1)) for i in range(output_size)],
+            dtype=torch.float32
+        ).to(device)
+        criterion = nn.CrossEntropyLoss(weight=weights)
     else:
         y = torch.tensor(y, dtype=torch.float32)
         output_size = y.shape[1] if len(y.shape) > 1 else 1

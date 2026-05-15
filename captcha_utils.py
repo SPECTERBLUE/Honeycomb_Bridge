@@ -22,12 +22,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------
 redis_client_binary = redis.Redis(
     host="localhost",
-    port=6379,
+    port=6389,
     decode_responses=False
 )
 redis_client = redis.Redis(
     host="localhost",
-    port=6379,
+    port=6389,
     decode_responses=True
 )
 
@@ -95,6 +95,17 @@ def decrypt_aes_gcm(encrypted: dict):
     except Exception as e:
         logger.warning(f"Failed to decrypt captcha: {e}", exc_info=True)
         return None
+    
+def encrypt_aes_gcm_downlink_login(plaintext: str):
+    iv = os.urandom(12)  # unique per encryption
+    ciphertext = login_aesgcm.encrypt(iv, plaintext.encode(), None)
+    encrypted = {
+        "iv": base64.b64encode(iv).decode(),
+        "ciphertext": base64.b64encode(ciphertext[:-16]).decode(),  # last 16 bytes = tag
+        "tag": base64.b64encode(ciphertext[-16:]).decode()
+    }
+    logger.info(f"Encrypted login data: {encrypted}")
+    return encrypted
 
 def decrypt_aes_gcm_downlink_login(encrypted: dict):
     if not encrypted or not all(k in encrypted for k in ("iv", "ciphertext", "tag")):
