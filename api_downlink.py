@@ -3013,7 +3013,7 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     magistrala_secret = encrypt_aes_gcm_downlink_login(password)  
     
     magistrala_token_response = requests.post( 
-        "https://iot.meridiandatalabs.com/users/tokens/issue",
+        "http://localhost:80/users/tokens/issue",
         json ={ 
         "identity": magistrala_identity,
         "secret": magistrala_secret
@@ -3052,7 +3052,7 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     # 8. get the JWT for edgex using the token and username
     
     JWT_responce_edgex = requests.get(
-        f"https://rapid.meridiandatalabs.com/vault/v1/identity/oidc/token/{edgex_user}",
+        f"http://localhost:8200/v1/identity/oidc/token/{edgex_user}",
         headers={"Authorization": f"Bearer {edgex_token}"}
     )
     if JWT_responce_edgex.status_code != 200:
@@ -3064,9 +3064,17 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     # 9. login for chirpstack and get the token
     
     chirpstack_login_response = requests.get(
-        "https://chirp.meridiandatalabs.com/api/tenants",
+        "http://localhost:8090/api/tenants?limit=1&offset=0",
         headers={"Authorization": f"Bearer {config.API_TOKEN}"}
     )
+    if chirpstack_login_response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to fetch ChirpStack tenants")
+
+    tenants_data = chirpstack_login_response.json()
+
+    first_tenant_id = tenants_data["result"][0]["id"]
+        
+    logging.info(f"First ChirpStack tenant ID: {first_tenant_id}")
     
     # 10. login for superset and get the token
     
@@ -3079,7 +3087,7 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     superset_secret = f"{magistrala_secret['iv']}:{magistrala_secret['ciphertext']}:{magistrala_secret['tag']}"
     
     superset_login_response = requests.post(
-        "https://superset.meridiandatalabs.com/api/v1/security/login",
+        "http://localhost:8018/api/v1/security/login",
         json={
             "username": superset_identity,
             "password": superset_secret,
@@ -3095,7 +3103,7 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     # session management and concurrnt session check
     
     sesson_management_response = requests.post(
-        "https://iot.meridiandatalabs.com/users/login",
+        "http://localhost:80/users/login",
         json={
             "identity": magistrala_identity,
             "password": magistrala_secret
@@ -3112,11 +3120,13 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
         "bridge_access_token": Bridge_access_token,
         "magistrala_access_token": magistrala_access_token,
         "magistrala_refresh_token": magistrala_refresh_token,
+        "edgex_token": edgex_token,
         "edgex_jwt": edgex_jwt,
         "superset_access_token": superset_access_token,
         "superset_refresh_token": superset_refresh_token,
         "session_token": session_token,
         "chirpstack_token": config.API_TOKEN,
+        "chirpstack_tenant_id": first_tenant_id,
         "failed_attempts_before_login": prior_fails
     }
     
