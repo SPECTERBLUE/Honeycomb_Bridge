@@ -2902,7 +2902,6 @@ class HoneycombAuthRequest(BaseModel):
     encrypted_input: dict  # { "iv": ..., "ciphertext": ..., "tag": ... }
     identity: dict
     secret: dict
-    mfa_code: Optional[str] = None
     
 _RATE_LIMIT_IP_MAX = 10        # max attempts per IP per window
 _RATE_LIMIT_WINDOW = 60        # seconds
@@ -2978,26 +2977,14 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
             "attempts_remaining": info["attempts_remaining"]
         })
 
-    # 5. MFA check
+    # 5. MFA check see if the user has MFA enabled
     if user.mfa_secret:
-        if not request.mfa_code:
-            raise HTTPException(status_code=400, detail="MFA code required")
-        totp = pyotp.TOTP(user.mfa_secret)
-        if not totp.verify(request.mfa_code):
-            info = await _record_login_failure(username)
-            if info["locked"]:
-                return JSONResponse(status_code=429, content={
-                    "status": "error",
-                    "message": f"Account locked for {LOGIN_LOCKOUT_TTL // 60} minutes due to too many failed login attempts.",
-                    "failed_attempts": info["failed_attempts"],
-                    "lockout_seconds": info["lockout_seconds"]
-                })
-            return JSONResponse(status_code=401, content={
-                "status": "error",
-                "message": "Invalid MFA code.",
-                "failed_attempts": info["failed_attempts"],
-                "attempts_remaining": info["attempts_remaining"]
-            })
+        user.mfa_secret = str(user.mfa_secret)  # ensure it's a string for the MFA check
+        mfa_enabled = True
+    else:
+        user.mfa_secret = None
+        mfa_enabled = False
+        
 
     # Success — read and clear any prior failure counters
     prior_fails_raw = await redis_client.get(f"login_fails:{username}")
@@ -3013,7 +3000,7 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     magistrala_secret = encrypt_aes_gcm_downlink_login(password)  
     
     magistrala_token_response = requests.post( 
-        "https://iot.meridiandatalabs.com/users/tokens/issue",
+        "http://localhost:80/users/tokens/issue",
         json ={ 
         "identity": magistrala_identity,
         "secret": magistrala_secret
@@ -3052,7 +3039,7 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     # 8. get the JWT for edgex using the token and username
     
     JWT_responce_edgex = requests.get(
-        f"https://rapid.meridiandatalabs.com/vault/v1/identity/oidc/token/{edgex_user}",
+        f"http://localhost:8200/v1/identity/oidc/token/{edgex_user}",
         headers={"Authorization": f"Bearer {edgex_token}"}
     )
     if JWT_responce_edgex.status_code != 200:
@@ -3064,9 +3051,17 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     # 9. login for chirpstack and get the token
     
     chirpstack_login_response = requests.get(
-        "https://chirp.meridiandatalabs.com/api/tenants",
+        "http://localhost:8090/api/tenants?limit=1&offset=0",
         headers={"Authorization": f"Bearer {config.API_TOKEN}"}
     )
+    if chirpstack_login_response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to fetch ChirpStack tenants")
+
+    tenants_data = chirpstack_login_response.json()
+
+    first_tenant_id = tenants_data["result"][0]["id"]
+        
+    logging.info(f"First ChirpStack tenant ID: {first_tenant_id}")
     
     # 10. login for superset and get the token
     
@@ -3079,7 +3074,7 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     superset_secret = f"{magistrala_secret['iv']}:{magistrala_secret['ciphertext']}:{magistrala_secret['tag']}"
     
     superset_login_response = requests.post(
-        "https://superset.meridiandatalabs.com/api/v1/security/login",
+        "http://localhost:8018/api/v1/security/login",
         json={
             "username": superset_identity,
             "password": superset_secret,
@@ -3095,7 +3090,7 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     # session management and concurrnt session check
     
     sesson_management_response = requests.post(
-        "https://iot.meridiandatalabs.com/users/login",
+        "http://localhost:80/users/login",
         json={
             "identity": magistrala_identity,
             "password": magistrala_secret
@@ -3106,18 +3101,72 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
         raise HTTPException(status_code=500, detail="Failed to manage user session")
     
     session_token = sesson_management_response.json().get("token")
-    # Return all tokens to frontend
-    return {
-        "status": "success",
+
+    all_tokens = {
         "bridge_access_token": Bridge_access_token,
         "magistrala_access_token": magistrala_access_token,
         "magistrala_refresh_token": magistrala_refresh_token,
+        "edgex_token": edgex_token,
         "edgex_jwt": edgex_jwt,
         "superset_access_token": superset_access_token,
         "superset_refresh_token": superset_refresh_token,
         "session_token": session_token,
         "chirpstack_token": config.API_TOKEN,
-        "failed_attempts_before_login": prior_fails
+        "chirpstack_tenant_id": first_tenant_id,
+        "failed_attempts_before_login": prior_fails,
+        "user_id": user.id,
+    }
+
+    if mfa_enabled:
+        mfa_pending_token = str(uuid.uuid4())
+        await redis_client.setex(f"mfa_pending:{mfa_pending_token}", 120, json.dumps(all_tokens))
+        return {
+            "status": "mfa_required",
+            "mfa_enabled": True,
+            "mfa_pending_token": mfa_pending_token,
+        }
+
+    return {
+        "status": "success",
+        "mfa_enabled": False,
+        **{k: v for k, v in all_tokens.items() if k != "user_id"},
+    }
+    
+class MFAVerifyRequest(BaseModel):
+    mfa_code: str
+    mfa_pending_token: str
+
+@app.post(
+    "/downlink/auth/honeycomb/mfa-verify",
+    summary="Verify MFA code for Honeycomb authentication"
+)
+async def honeycomb_mfa_verify(
+    request: MFAVerifyRequest,
+    db: Session = Depends(get_db)
+):
+    pending_raw = await redis_client.get(f"mfa_pending:{request.mfa_pending_token}")
+    if not pending_raw:
+        raise HTTPException(status_code=401, detail="MFA session expired or invalid")
+
+    pending = json.loads(pending_raw)
+
+    user = db.query(models.User).filter(models.User.id == pending["user_id"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not user.mfa_secret:
+        raise HTTPException(status_code=400, detail="MFA not enabled for this user")
+
+    totp = pyotp.TOTP(str(user.mfa_secret))
+    if not totp.verify(request.mfa_code):
+        raise HTTPException(status_code=401, detail="Invalid MFA code")
+
+    await redis_client.delete(f"mfa_pending:{request.mfa_pending_token}")
+
+    return {
+        "status": "success",
+        "mfa_enabled": True,
+        **{k: v for k, v in pending.items() if k != "user_id"},
     }
     
 # check GPU specifications and availability for LSTM training

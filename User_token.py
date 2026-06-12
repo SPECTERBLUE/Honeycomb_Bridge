@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 def update_user_list():
     """Main logic for user fetching and edgex_users.json maintenance."""
-    list_of_users = UserFetcher().fetch_all_users()
+    list_of_users = UserFetcher().fetch_all_vault_users()
 
     users = list_of_users.get("users")
     if users and isinstance(users, list):
@@ -71,7 +71,7 @@ def update_user_list():
 
 
 EDGEX_USERS_FILE = "edgex_users.json"
-ADMIN_TOKEN_URL = "http://183.82.1.171:8200/v1/identity/oidc/token/admin"
+ADMIN_TOKEN_URL = "http://localhost:8200/v1/identity/oidc/token/admin"
 RULES_LIST_URL = "https://edge.meridiandatalabs.com/rules-engine/rules"
 RULE_DETAIL_URL_TEMPLATE = "https://edge.meridiandatalabs.com/rules-engine/rules/{rule_name}"
 RULE_UPDATE_URL_TEMPLATE = "https://edge.meridiandatalabs.com/rules-engine/rules/{rule_name}"
@@ -194,7 +194,7 @@ def chirpstack_auth_http_rotation(jwt):
 
         try:
             parameters = {
-                'limit': 10,
+                'limit': 100,
                 'offset': 0
             }
             # Fetch tenant details

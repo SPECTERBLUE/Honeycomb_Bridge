@@ -196,3 +196,64 @@ class UserFetcher:
         except ValueError as e:
             logging.error(f"Error parsing user list response: {e}")
             return None
+
+    def fetch_all_users_vault(self):
+        """
+        Fetches all users from the API (handles pagination automatically).
+        :return: A list of all users if successful, None otherwise.
+        """
+        tokens = self.fetch_auth_token_with_domain_id()
+
+    # Handle case where tokens is a list instead of a dict
+        if isinstance(tokens, list) and len(tokens) > 0:
+            tokens = tokens[0]
+            
+        if not tokens or not tokens.get("access_token"):
+            logging.error("Failed to fetch users: no valid auth token.")
+            return None
+
+        url = f"{self.base_url}/users"
+        headers = {
+            "Authorization": f"Bearer {tokens['access_token']}",
+            "Accept": "application/json"
+        }
+
+        all_users = []
+        limit = 100
+        offset = 0
+
+        try:
+            while True:
+                params = {
+                    "limit": limit,
+                    "offset": offset,
+                    "status": "enabled"
+                }
+
+                response = requests.get(url, headers=headers, params=params)
+                response.raise_for_status()
+                data = response.json()
+
+            # Assuming API response structure: {"users": [...], "total": 123}
+                users = data.get("users", [])
+                total = data.get("total", 0)
+
+                all_users.extend(users)
+
+                logging.info(f"Fetched {len(users)} users (offset={offset}).")
+
+            # Stop if fewer than limit were returned → no more pages
+                if len(all_users) >= total or len(users) == 0:
+                    break
+
+                offset += limit
+
+            logging.info(f"Total users fetched: {len(all_users)}")
+            return {"users": all_users}
+
+        except requests.RequestException as e:
+            logging.error(f"Error fetching users: {e}")
+            return None
+        except ValueError as e:
+            logging.error(f"Error parsing user list response: {e}")
+            return None

@@ -1,336 +1,425 @@
+# Predictive_ML Module
 
-```md
-# 🧠 Predictive_ML Module
+The **Predictive_ML** module provides end-to-end machine learning capabilities for predictive maintenance within the Honeycomb Bridge platform.
 
-The **Predictive_ML** module provides end-to-end machine learning capabilities for predictive maintenance.
-
-It supports:
-
-- Training ML models
-- Storing trained models in Redis
-- Loading models for inference
-- Running predictions
-- Listing and deleting stored models
-- User-defined model versioning
-- Horizon-based future prediction (1, 6, 24 hours)
+**Capabilities:**
+- Fetch and aggregate sensor telemetry from Honeycomb channels
+- Label raw data using threshold-based or equipment-specific fault classifiers
+- Train ML models (Random Forest, XGBoost, LSTM) and store them in Redis
+- Run multi-horizon future predictions (1h / 6h / 24h)
+- Equipment-specific training and inference (e.g. 60kW Slipring Induction Motor)
+- Async training and prediction jobs with status polling
+- User-defined model versioning with duplicate protection
 
 ---
 
-# 📦 Project Structure
-
-
-Predictive_ML/
-│
-├── ml/
-│ ├── trainers/
-│ │ ├── random_forest.py
-│ │ └── **init**.py
-│ │
-│ ├── model_store.py
-│ ├── prediction.py
-│ ├── train_service.py
-│ └── **init**.py
-│
-├── fetch_assets_telemetry.py
-├── telemetry_processor.py
-├── training_dataset_csv_creation.py
-├── predict_api.py
-
-
----
-
-# 📂 Module Structure Explanation
-
-## 📁 ml/
-
-Core machine learning logic lives here.  
-This folder contains all training, storage, and prediction-related components.
-
----
-
-## 📁 ml/trainers/
-
-Contains algorithm-specific training implementations.  
-This structure allows easy extension to support multiple ML algorithms.
-
-### 🔹 `random_forest.py`
-
-Implements Random Forest model training using **scikit-learn**.
-
-**Responsibilities:**
-
-- Split dataset into train/test
-- Train RandomForest model
-- Support classification and regression
-- Return trained model
-- Return evaluation metrics:
-  - Accuracy
-  - Precision
-  - Recall
-  - etc.
-
-**Extensible for:**
-
-- Hyperparameter tuning
-- GridSearch
-- Additional ML algorithms
-
----
-
-### 🔹 `__init__.py (trainers)`
-
-- Makes the trainers directory a Python module  
-- Enables clean imports
-
----
-
-## 🔹 `model_store.py`
-
-Responsible for model persistence in Redis.
-
-**Responsibilities:**
-
-- Serialize models using pickle
-- Store model metadata as JSON
-- Load models from Redis
-- List stored models
-- Delete models
-- Maintain model registry set
-
-### Redis Keys Used
+# Project Structure
 
 ```
-
-ml:model:{model_name}
-ml:model:meta:{model_name}
-ml:model:list
-
-````
-
----
-
-## 🔹 `train_service.py`
-
-Acts as the training orchestration layer.
-
-**Responsibilities:**
-
-- Load training dataset (CSV)
-- Select algorithm (`random_forest`, etc.)
-- Call appropriate trainer
-- Collect evaluation metrics
-- Prepare metadata
-- Store model in Redis using `model_store`
-
-This connects the API layer with ML logic.
+Predictive_ML/
+│
+├── fetch_assets_telemetry.py          # Telemetry fetching from Honeycomb channels
+├── telemetry_processor.py             # Aggregation, missing-window handling, labeling
+├── training_dataset_csv_creation.py   # Converts processed data to training CSV
+├── pre_trained_models.py              # Equipment-specific fault labelers & label maps
+├── sensor_mapping.json                # Sensor name mappings per equipment type
+│
+└── ml/
+    ├── train_service.py               # Training orchestration & inference engine
+    ├── model_store.py                 # Redis model persistence (async)
+    ├── prediction.py                  # Generic & equipment-specific prediction runners
+    ├── predition_store.py             # Redis prediction result storage (async)
+    │
+    └── trainers/
+        ├── random_forest.py           # Scikit-learn RandomForestClassifier
+        ├── xgboost.py                 # XGBClassifier (multi-class & binary)
+        └── lstm.py                    # PyTorch LSTM (fault classification & sensor regression)
+```
 
 ---
 
-## 🔹 `prediction.py`
+# Module Components
 
-Responsible for:
+## `fetch_assets_telemetry.py` — `FetchAssetsTelemetry`
 
-- Loading stored model
-- Preprocessing input features
-- Running inference
-- Returning prediction results
+Fetches raw telemetry from Honeycomb HTTP channels with pagination.
 
-Used internally by `predict_api`.
-
----
-
-## 🔹 `__init__.py (ml)`
-
-- Marks `ml` as a Python module  
-- Enables clean imports
-
-```python
-from Predictive_ML.ml.train_service import TrainService
-````
+- `get_telemetry_data_asset(asset_id)` — Fetches all telemetry for an entire asset (up to 100k messages, batch size 1000)
+- `get_telemetry_data_things(asset_id, thing_id)` — Filtered fetch for a specific publisher/thing within an asset
+- Uses auth tokens from `User_fetcher` internally
 
 ---
 
-# 📊 Telemetry & Dataset Processing
+## `telemetry_processor.py` — `TelemetryProcessor`
 
-These files handle data preparation before model training.
+Converts raw telemetry messages into structured, ML-ready windows.
 
----
-
-## 🔹 `fetch_assets_telemetry.py`
-
-**Responsibilities:**
-
-* Fetch raw telemetry data
-* Retrieve telemetry for:
-
-  * Entire asset
-  * Specific thing within asset
-* Act as data source connector
+- `aggregate_window(window_length)` — Fixed-size time window aggregation (avg/min/max per sensor)
+- `handle_missing_windows()` — Forward-fills up to 3 consecutive missing windows; marks sensor as `NOT_WORKING` if gap exceeds 3
+- `label_data(threshold_map)` — Threshold-based multi-class labeling (`normal` / `pre-failure` / `failure`)
 
 ---
 
-## 🔹 `telemetry_processor.py`
+## `training_dataset_csv_creation.py`
 
-Processes raw telemetry data.
-
-**Responsibilities:**
-
-* Aggregate data using configurable time windows
-* Handle missing windows
-* Apply threshold-based labeling
-* Convert raw telemetry into structured ML-ready dataset
-
----
-
-## 🔹 `training_dataset_csv_creation.py`
-
-**Responsibilities:**
-
-* Convert processed & labeled data into CSV
-* Save dataset under:
-
+Converts labeled, aggregated data into a CSV file saved under:
 ```
 data/training_datasets/
 ```
-
-* Return dataset path for training API
-
----
-
-## 🔹 `predict_api.py`
-
-Runs predictions using stored ML models.
-
-**Responsibilities:**
-
-* Fetch telemetry data for a given asset
-* Aggregate using configured window length
-* Handle missing windows
-* Load trained model & metadata from Redis
-* Run inference
-* Return predictions for future horizon:
-
-  * 1 hour
-  * 6 hours
-  * 24 hours
-
-### Redis Keys Used
-
-```
-Window_length:{asset_id}
-threshold_map:{asset_id}
-ml:model:{model_name}
-ml:model:meta:{model_name}
-```
+Returns the dataset path for use by the training API.
 
 ---
 
-# 🔄 Overall Workflow
+## `pre_trained_models.py` — Equipment-Specific Labeling
 
-1. Fetch telemetry
-2. Aggregate and label data
-3. Generate training CSV
-4. Train ML model
-5. Store model in Redis
-6. Load model for prediction
-7. Predict future horizon values
+Defines custom fault labeling functions and class maps for specific equipment types.
 
----
+**Currently implemented: Slipring Induction Motor 60kW**
 
-# 🧩 Model Versioning
+| Class | Label | Trigger Condition |
+|-------|-------|-------------------|
+| 0 | Healthy | Normal operation |
+| 1 | Overload | High stator current + rising temperature |
+| 2 | Rotor/Slipring Fault | Rotor current abnormality |
+| 3 | Stator Fault | Stator current spike |
+| 4 | Mechanical Fault | High vibration + high temperature |
 
-Model versioning is handled using a **user-defined unique model name**.
+Labeling follows a priority hierarchy (4 → 3 → 2 → 1 → 0).
 
-### During model training:
-
-* Client must provide a `model_name`
-* System checks Redis for duplicates
-* If name exists → API returns **400 error**
-* Existing models are **never overwritten**
-
-This ensures safe and controlled model lifecycle management.
+**To add new equipment:** implement a custom labeling function and register it in `EQUIPMENT_LABELERS`.
 
 ---
 
-# 🌐 API Endpoints
+## `ml/model_store.py`
 
-Defined in:
+Handles async serialization and retrieval of ML models in Redis.
 
+| Function | Responsibility |
+|----------|---------------|
+| `store_model(name, model, metadata)` | Pickle model + store JSON metadata |
+| `load_model(name)` | Retrieve and unpickle model + metadata |
+| `list_models()` | Return all model names from registry set |
+| `delete_model(name)` | Remove model, metadata, and registry entry |
+
+**Redis keys:**
 ```
-api_downlink.py
-```
-
-| Method | Endpoint                                      | Description                                                   |
-| ------ | --------------------------------------------- | ------------------------------------------------------------- |
-| POST   | `/downlink/predictive_ML/assets/telemetry`    | Fetch, aggregate, label telemetry & generate training dataset |
-| POST   | `/downlink/predictive_ML/things/telemetry`    | Fetch telemetry for specific thing                            |
-| GET    | `/downlink/predictive_ML/datasets`            | List available training CSV datasets                          |
-| POST   | `/downlink/predictive_ML/train`               | Train ML model & store in Redis                               |
-| GET    | `/downlink/predictive_ML/models`              | List stored models                                            |
-| GET    | `/downlink/predictive_ML/models/{model_name}` | Get model metadata                                            |
-| POST   | `/downlink/predictive_ML/predict`             | Run future prediction                                         |
-| DELETE | `/downlink/predictive_ML/models/{model_name}` | Delete stored model                                           |
-
----
-
-# 🗄 Storage Architecture
-
-* **Redis** → Model persistence
-* **Pickle** → Model serialization
-* **JSON** → Metadata storage
-* **Redis Set** → Model registry
-* Asset-based storage for:
-
-  * Window length
-  * Threshold configuration
-
----
-
-# 🚀 Extensibility
-
-The module is designed to be easily extended:
-
-1. Add new algorithms inside:
-
-```
-ml/trainers/
-```
-
-2. Plug into:
-
-```
-train_service.py
-```
-
-3. Store models automatically via `model_store`
-4. Reuse the existing prediction pipeline
-
----
-
-# 📌 Summary
-
-The **Predictive_ML** module provides a complete ML lifecycle:
-
-```
-Data → Processing → Training → Storage → Prediction → Version Management
-```
-
-Designed for:
-
-* Scalable deployments
-* Container-based environments
-* Predictive maintenance systems
-
+ml:model:{model_name}            → Serialized model (pickle binary)
+ml:model:meta:{model_name}       → Model metadata (JSON)
+ml:model:list                    → Set of all model names
 ```
 
 ---
 
-## If you want, I can next:
-- Add **installation & setup steps**
-- Add **example API request/response payloads**
-- Add **Docker / environment configuration**
-- Add **architecture diagram**
-- Add **MLOps notes (retraining, monitoring, drift handling)**
+## `ml/train_service.py` — `TrainService`
 
-Just tell me your target audience (developers, DevOps, data scientists, clients).
+Core orchestration layer bridging data ingestion, feature engineering, training, and inference.
+
+**Training methods:**
+- `train(csv_path, model_name, target_column, algorithm, horizon)` — Generic training from CSV
+- `train_specific_model(...)` — Equipment-specific training with custom labeling function
+- `covert_csv_to_dataframe()` — Converts long-format CSV to wide ML-ready format (sensor columns)
+- `create_sequences(df, seq_len)` — Generates temporal sequences for LSTM input
+
+**Prediction methods:**
+- `future_predict(model, meta, df, horizon)` — Single-step future prediction for tabular models
+- `predict_future_asset(model_name, asset_id, horizon)` — Multi-step sliding-window prediction for an asset
+
+**Feature engineering applied during both training and prediction:**
+- Pairwise rolling correlations between sensor columns
+- StandardScaler normalization
+- NaN / Inf replacement (→ 0)
+
+---
+
+## `ml/trainers/`
+
+### `random_forest.py`
+- **Algorithm:** `RandomForestClassifier` (scikit-learn)
+- **Config:** 300 trees, max depth 12, balanced class weights, `n_jobs=-1`
+- **Output:** trained model + accuracy + confusion matrix
+
+### `xgboost.py`
+- **Algorithm:** `XGBClassifier`
+- **Config:** 400 estimators, GPU support; handles multiclass and binary targets
+- **Output:** trained model + accuracy + confusion matrix + class probabilities
+
+### `lstm.py`
+- **Architecture:** `LSTMModel(nn.Module)` — LSTM(hidden=64) → FC(output_size)
+- **Supports:** fault classification (multi-class) and sensor value regression
+- **Config:** `seq_len=10`, GPU-accelerated when CUDA is available, weighted cross-entropy for imbalanced classes
+- **Output:** trained model + scaler tuple, accuracy/metrics or MSE/MAE
+
+---
+
+## `ml/prediction.py`
+
+Entry point for running inference.
+
+- `predict(model_name, asset_id)` — Generic prediction: fetch telemetry → load model → run inference
+- `predict_specific(model_name, asset_id, equipment_type)` — Equipment-specific prediction with matching labeling function
+
+---
+
+## `ml/predition_store.py`
+
+Stores prediction results in Redis for later retrieval.
+
+**Redis key format:**
+```
+prediction:{asset_id}:{model_name}:{horizon}   → JSON prediction blob
+```
+
+---
+
+# Data Flow
+
+## Training Pipeline
+
+```
+API: POST /downlink/predictive_ML/train
+         │
+         ▼
+  Load CSV (data/training_datasets/)
+         │
+         ▼
+  TrainService.covert_csv_to_dataframe()
+  (long → wide: sensor_avg columns)
+         │
+         ▼
+  Feature Engineering
+  ├── Pairwise rolling correlations
+  ├── StandardScaler normalization
+  └── Drop NaN / Inf
+         │
+         ▼
+  Select & Train Algorithm
+  ├── Random Forest  (300 trees, balanced weights)
+  ├── XGBoost        (400 estimators, GPU optional)
+  └── LSTM           (seq_len=10, hidden=64, GPU optional)
+         │
+         ▼
+  Collect Metrics
+  (accuracy, confusion matrix, label distribution, sensor correlations)
+         │
+         ▼
+  model_store.store_model()
+  (pickle + JSON metadata → Redis)
+```
+
+## Prediction Pipeline
+
+```
+API: POST /downlink/predictive_ML/predict
+         │
+         ▼
+  FetchAssetsTelemetry.get_telemetry_data_asset()
+         │
+         ▼
+  TelemetryProcessor
+  ├── aggregate_window(window_length)
+  ├── handle_missing_windows()
+  └── label_data(threshold_map)
+         │
+         ▼
+  model_store.load_model(model_name)
+  (retrieve + unpickle from Redis)
+         │
+         ▼
+  TrainService.predict_future_asset()
+  ├── Convert to wide format
+  ├── Recompute correlation features
+  └── Run model.predict() × horizon steps
+         │
+         ▼
+  Build predictions JSON
+  (timestamps, values, probabilities, confidence, named_probabilities)
+         │
+         ▼
+  predition_store.store_prediction() + return to caller
+```
+
+---
+
+# Supported Algorithms & Prediction Types
+
+| Algorithm | Input Type | Supports Fault | Supports Sensor Value | GPU |
+|-----------|-----------|:-:|:-:|:-:|
+| Random Forest | Tabular (wide) | Yes | No | No |
+| XGBoost | Tabular (wide) | Yes | No | Optional |
+| LSTM | Temporal sequences | Yes | Yes | Optional |
+
+**Prediction horizons:** `1h` (12 steps), `6h` (72 steps), `24h` (288 steps) at 5-minute frequency.
+
+---
+
+# Prediction Output Format
+
+```json
+{
+  "timestamps": [1715000000, 1715000300, ...],
+  "values": [0, 1, 0],
+  "probabilities": [[0.95, 0.05, 0.0], ...],
+  "confidence": [0.95, 0.87, 0.79],
+  "predicted_label": "Healthy",
+  "named_probabilities": {"Healthy": 0.95, "Overload": 0.05, "Mechanical Fault": 0.0},
+  "confusion_matrix": [[50, 2, 1], ...],
+  "sensor_correlation": {"columns": [...], "matrix": [...]},
+  "meta": {"type": "fault", "mode": "multi_step", "horizon": "6h"}
+}
+```
+
+**Confidence scoring:**
+
+| Model | Source |
+|-------|--------|
+| RF / XGBoost | `max(predict_proba())` |
+| LSTM (fault) | Max softmax probability |
+| LSTM (sensor) | Gaussian estimate from historical std |
+
+---
+
+# Model Versioning
+
+- User provides a base name (e.g. `motor_v1`)
+- System appends a timestamp suffix: `motor_v1_20250515144500`
+- Duplicate names → **HTTP 400** (no overwrite)
+- Old models must be explicitly deleted via the DELETE endpoint
+
+**Metadata stored per model:**
+```json
+{
+  "algorithm": "xgboost",
+  "target_column": "label",
+  "horizon": "6h",
+  "prediction_type": "fault",
+  "features": ["Vibration_avg", "Temperature_avg", "..."],
+  "correlation_pairs": [["Vibration_avg", "Temperature_avg"], "..."],
+  "metrics": {"accuracy": 0.94, "confusion_matrix": "..."},
+  "trained_at": "20250515144500",
+  "freq_minutes": 5,
+  "rows": 1200,
+  "equipment_type": "Slipring Induction motor 60kw",
+  "sequence_length": 10,
+  "horizon_steps": 72,
+  "num_classes": 5
+}
+```
+
+---
+
+# Redis Storage Schema
+
+| Key | Type | Content |
+|-----|------|---------|
+| `ml:model:{name}` | Binary | Serialized model (pickle) |
+| `ml:model:meta:{name}` | String | Model metadata (JSON) |
+| `ml:model:list` | Set | Registry of all model names |
+| `Window_length:{asset_id}` | Integer | Telemetry aggregation window (seconds) |
+| `threshold_map:{asset_id}` | String | Sensor thresholds for labeling (JSON) |
+| `sensor_map:{model_base_name}` | String | Equipment sensor name mappings (JSON) |
+| `prediction:{asset_id}:{model}:{horizon}` | String | Latest prediction result (JSON) |
+| `train:{job_id}:{model_name}:{target_col}` | String | Async training job status + results |
+
+---
+
+# API Endpoints
+
+Defined in `api_downlink.py`.
+
+## Telemetry & Dataset
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/downlink/predictive_ML/assets/telemetry` | Fetch, aggregate, label telemetry → generate training CSV |
+| POST | `/downlink/predictive_ML/things/telemetry` | Fetch telemetry for a specific thing/publisher |
+| GET | `/downlink/predictive_ML/datasets` | List available training CSV datasets |
+
+## Training
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/downlink/predictive_ML/train` | Submit async training job |
+| GET | `/downlink/predictive_ML/status/train/{job_id}` | Poll async training job status |
+
+## Models
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/downlink/predictive_ML/models` | List all stored models |
+| GET | `/downlink/predictive_ML/models/{model_name}` | Get model metadata |
+| DELETE | `/downlink/predictive_ML/models/{model_name}` | Delete a stored model |
+
+## Prediction
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/downlink/predictive_ML/predict` | Submit async prediction job |
+| GET | `/downlink/predictive_ML/status/pred/{job_id}` | Poll async prediction job status |
+
+## Equipment-Specific (Advanced)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/downlink/predictive_ML/Asset_specific/assets/fetch-train` | Equipment-specific fetch + train pipeline |
+| POST | `/downlink/predictive_ML/predict/specific` | Equipment-specific prediction |
+
+## Sensor Mapping
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/downlink/predictive_ML/model/sensor-mapping` | Get stored sensor mapping for a model |
+| GET | `/downlink/predictive_ML/model/sensor-mapping/default` | Load default `sensor_mapping.json` |
+
+## Redis Utilities
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/downlink/predictive_ML/redis/keys` | List all ML-related Redis keys |
+| GET | `/downlink/predictive_ML/redis/key` | Inspect a specific Redis key |
+| DELETE | `/downlink/predictive_ML/redis/key` | Delete a specific Redis key |
+
+---
+
+# Integration with Honeycomb Bridge
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  HONEYCOMB BRIDGE  (FastAPI, port 4567)                  │
+│  ├─ PostgreSQL  — device models, users, config           │
+│  ├─ Redis       — sessions, model storage, pred cache    │
+│  ├─ MQTT        — real-time device telemetry             │
+│  ├─ gRPC        — ChirpStack integration                 │
+│  │                                                        │
+│  └─ PREDICTIVE_ML MODULE                                 │
+│     ├─ Fetches telemetry via HTTP channels               │
+│     ├─ Uses auth tokens from User_fetcher.py             │
+│     ├─ Stores models & predictions in Redis              │
+│     └─ Exposed via api_downlink.py                       │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Key internal dependencies:**
+- `User_fetcher.FetchAssetsTelemetry` — auth tokens + HTTP telemetry
+- `captcha_utils.redis_client` — async Redis operations
+- `auth.get_current_user()` — FastAPI authorization dependency
+
+---
+
+# Extensibility
+
+To add a new ML algorithm:
+1. Create `ml/trainers/{algorithm}.py` with a `train_{algorithm}(X, y, ...)` function
+2. Register it in `TrainService.train()` algorithm selector in `ml/train_service.py`
+
+To add a new equipment type:
+1. Define a custom labeling function in `pre_trained_models.py`
+2. Add class label mapping to `EQUIPMENT_FAULT_LABELS`
+3. Register the labeler in `EQUIPMENT_LABELERS`
+
+---
+
+# ML Lifecycle Summary
+
+```
+Telemetry → Aggregation → Labeling → CSV → Training → Redis → Prediction → Output
 ```
