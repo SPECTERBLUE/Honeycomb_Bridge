@@ -3121,11 +3121,11 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
 # mfa verification endpoint for the frontend to call after getting the response from the above login endpoint. The frontend will prompt the user for the MFA code and then call this endpoint to verify the code. If the code is correct, it will return a success response and the user can proceed to use the application. If the code is incorrect, it will return an error response and the user will have to try again.
 @app.post("/downlink/auth/honeycomb/mfa-verify", summary="Verify MFA code for Honeycomb authentication")
 async def honeycomb_mfa_verify(
-    username: str = Body(...),
+    email: str = Body(...),
     mfa_code: str = Body(...),
     db: Session = Depends(get_db)
 ):
-    user = db.query(auth.User).filter(auth.User.username == username).first()
+    user = db.query(auth.User).filter(auth.User.email == email).first()
     if not user or not user.mfa_secret:
         raise HTTPException(status_code=400, detail="MFA not enabled for this user")
 
