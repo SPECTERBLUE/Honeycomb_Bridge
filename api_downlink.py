@@ -3101,10 +3101,8 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
         raise HTTPException(status_code=500, detail="Failed to manage user session")
     
     session_token = sesson_management_response.json().get("token")
-    # Return all tokens to frontend
-    return {
-        "status": "success",
-        "mfa_enabled": mfa_enabled,
+
+    all_tokens = {
         "bridge_access_token": Bridge_access_token,
         "magistrala_access_token": magistrala_access_token,
         "magistrala_refresh_token": magistrala_refresh_token,
@@ -3115,25 +3113,61 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
         "session_token": session_token,
         "chirpstack_token": config.API_TOKEN,
         "chirpstack_tenant_id": first_tenant_id,
-        "failed_attempts_before_login": prior_fails
+        "failed_attempts_before_login": prior_fails,
+        "user_id": user.id,
+    }
+
+    if mfa_enabled:
+        mfa_pending_token = str(uuid.uuid4())
+        await redis_client.setex(f"mfa_pending:{mfa_pending_token}", 120, json.dumps(all_tokens))
+        return {
+            "status": "mfa_required",
+            "mfa_enabled": True,
+            "mfa_pending_token": mfa_pending_token,
+        }
+
+    return {
+        "status": "success",
+        "mfa_enabled": False,
+        **{k: v for k, v in all_tokens.items() if k != "user_id"},
     }
     
-# mfa verification endpoint for the frontend to call after getting the response from the above login endpoint. The frontend will prompt the user for the MFA code and then call this endpoint to verify the code. If the code is correct, it will return a success response and the user can proceed to use the application. If the code is incorrect, it will return an error response and the user will have to try again.
-@app.post("/downlink/auth/honeycomb/mfa-verify", summary="Verify MFA code for Honeycomb authentication")
+class MFAVerifyRequest(BaseModel):
+    mfa_code: str
+    mfa_pending_token: str
+
+@app.post(
+    "/downlink/auth/honeycomb/mfa-verify",
+    summary="Verify MFA code for Honeycomb authentication"
+)
 async def honeycomb_mfa_verify(
-    email: str = Body(...),
-    mfa_code: str = Body(...),
+    request: MFAVerifyRequest,
     db: Session = Depends(get_db)
 ):
-    user = db.query(auth.User).filter(auth.User.email == email).first()
-    if not user or not user.mfa_secret:
+    pending_raw = await redis_client.get(f"mfa_pending:{request.mfa_pending_token}")
+    if not pending_raw:
+        raise HTTPException(status_code=401, detail="MFA session expired or invalid")
+
+    pending = json.loads(pending_raw)
+
+    user = db.query(models.User).filter(models.User.id == pending["user_id"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not user.mfa_secret:
         raise HTTPException(status_code=400, detail="MFA not enabled for this user")
 
     totp = pyotp.TOTP(str(user.mfa_secret))
-    if totp.verify(mfa_code):
-        return {"status": "success", "message": "MFA verification successful"}
-    else:
+    if not totp.verify(request.mfa_code):
         raise HTTPException(status_code=401, detail="Invalid MFA code")
+
+    await redis_client.delete(f"mfa_pending:{request.mfa_pending_token}")
+
+    return {
+        "status": "success",
+        "mfa_enabled": True,
+        **{k: v for k, v in pending.items() if k != "user_id"},
+    }
     
 # check GPU specifications and availability for LSTM training
 @app.get("/downlink/predictive_ML/lstm/gpu-info", summary="Get GPU information for LSTM training")
