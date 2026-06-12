@@ -12,7 +12,6 @@ from Predictive_ML.ml.trainers.lstm import train_lstm
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 import torch
-from collections import Counter
 
 #  Device selection (GPU if available, else CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -304,10 +303,6 @@ class TrainService:
             if len(X_seq) == 0:
                 raise ValueError("Not enough data to create sequences")
             
-            if prediction_type == "fault":
-                print("=== SEQUENCE LABEL DIST ===")
-                print(Counter(y_seq.tolist()))
-                
             num_classes = int(np.max(y_seq)) + 1 if prediction_type == "fault" else None
 
             split_idx = int(len(X_seq) * 0.8)
@@ -344,8 +339,6 @@ class TrainService:
 
             X = df.drop(columns=drop_cols)
             y = df[target_column].astype(int)
-            
-            print(y.value_counts(normalize=True).sort_index())
 
             if algorithm == "random_forest":
                 model, metrics = train_random_forest(
@@ -434,13 +427,9 @@ class TrainService:
         label_function = EQUIPMENT_LABELERS[equipment_type]
         df = label_function(df, thresholds)
         
-        print("=== LABELS AFTER label_motor_faults ===")
-        print(df["label"].value_counts().sort_index())
-
         df = df.sort_values("window_start")
 
         steps = horizon_to_steps(horizon, freq_minutes)
-        print(f"=== STEPS: {steps}, HORIZON: {horizon}, FREQ: {freq_minutes} ===")
 
         prediction_type = "sensor" if target_column != "label" else "fault"
 
@@ -529,9 +518,6 @@ class TrainService:
             if len(X_seq) == 0:
                 raise ValueError("Not enough data to create sequences")
             
-            if prediction_type == "fault":
-                print(Counter(y_seq.tolist()))
-
             num_classes = int(np.max(y_seq)) + 1 if prediction_type == "fault" else None
 
             split_idx = int(len(X_seq) * 0.8)
@@ -577,12 +563,6 @@ class TrainService:
             X = df.drop(columns=drop_cols)
             y = df[target_column].astype(int)
 
-            print("=== LABEL DIST (after shift) ===")
-            print(y.value_counts().sort_index())
-
-            print("=== UNIQUE CLASSES ===")
-            print(sorted(np.unique(y)))
-
             # =====================================================
             # RANDOM FOREST
             # =====================================================
@@ -601,35 +581,9 @@ class TrainService:
             # =====================================================
             elif algorithm == "xgboost":
 
-                num_classes = len(np.unique(y))
-
-                # 🔹 MULTICLASS
-                if num_classes > 2:
-
-                    model, metrics = train_xgboost(
-                        X,
-                        y,
-                        test_size=test_size,
-                        random_state=random_state,
-                        objective="multi:softprob",
-                        num_class=num_classes,
-                        eval_metric="mlogloss"
-                    )
-
-                # 🔹 BINARY
-                else:
-
-                    counts = y.value_counts()
-
-                    scale = float(counts.get(0, 1)) / float(counts.get(1, 1))
-
-                    model, metrics = train_xgboost(
-                        X,
-                        y,
-                        test_size=test_size,
-                        random_state=random_state,
-                        scale_pos_weight=scale
-                    )
+                model, metrics = train_xgboost(
+                    X, y, test_size=test_size, random_state=random_state
+                )
 
             else:
                 raise ValueError(f"Unsupported algorithm: {algorithm}")
@@ -787,8 +741,8 @@ class TrainService:
                 values = per_step_values
                 probs = per_step_probs
                 confidence = per_step_conf
-                predicted_label = fault_labels.get(values[-1], str(values[-1]))
-                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(per_step_probs[-1])}
+                predicted_label = fault_labels.get(values[0], str(values[0]))
+                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(per_step_probs[0])}
 
                 # confusion matrix on historical labeled sequences
                 cm = None
@@ -1021,8 +975,8 @@ class TrainService:
                 values = per_step_values
                 probs = per_step_probs
                 confidence = per_step_conf
-                predicted_label = fault_labels.get(values[-1], str(values[-1]))
-                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(per_step_probs[-1])}
+                predicted_label = fault_labels.get(values[0], str(values[0]))
+                named_probs = {fault_labels.get(i, f"Class {i}"): round(p, 4) for i, p in enumerate(per_step_probs[0])}
 
                 # confusion matrix on historical labeled sequences
                 cm = None
