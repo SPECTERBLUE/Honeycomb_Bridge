@@ -1,0 +1,9 @@
+[
+  {
+    "host": "192.168.1.15",
+    "port": 22,
+    "username": "honeycomb",
+    "remote_path": "/home/honeycomb/test-nas-backup",
+    "last_used": "2026-06-14T13:38:19.706620+00:00"
+  }
+]

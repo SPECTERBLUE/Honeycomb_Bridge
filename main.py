@@ -5,6 +5,9 @@ import grpc
 import uvicorn
 import os
 from scheduler import start_scheduler
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Timescale_db'))
+from backup_scheduler import start_backup_scheduler
 from event_fetcher_parse import initialize_key_rotation, start_mqtt_client
 from captcha_utils import init_redis
 import asyncio
@@ -81,6 +84,10 @@ if __name__ == "__main__":
         logger.info("Starting device scheduler...")
         scheduler_thread = threading.Thread(target=start_scheduler, daemon=True)
         scheduler_thread.start()
+        
+        logger.info("Starting backup scheduler...")          # ← add this
+        backup_sched_thread = threading.Thread(target=start_backup_scheduler, daemon=True)
+        backup_sched_thread.start()
 
         logger.info("Initializing key rotation...")
         key_rotation_thread = threading.Thread(target=initialize_key_rotation, args=(channel, auth_token), daemon=True)
