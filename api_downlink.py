@@ -59,7 +59,8 @@ from psycopg2.extras import execute_batch
 from db_config import get_source_conn, get_target_conn
 from Timescale_db.secure_export import secure_export
 from Timescale_db.secure_import import COLUMNS, secure_import
-from Timescale_db.transfer_utils import decrypt, load_key, sftp_connect, sha256_hex
+from transfer_utils import decrypt, encrypt, load_key, sftp_connect, sha256_hex
+
 from captcha_utils import (
     encrypt_aes_gcm_downlink_login,
     redis_client,
@@ -3265,11 +3266,7 @@ def _load_nas_configs() -> dict:
     except Exception:
         return {}
     
-# Start the scheduler when running as a standalone server.
-# When running via main.py, main.py calls start_backup_scheduler() instead.
-start_backup_scheduler()
-
-
+    
 # ── Helpers ─────────────────────────────────────────────
 
 @contextmanager
@@ -3331,7 +3328,7 @@ class NasScheduleRequest(BaseModel):
 # ── Health ──────────────────────────────────────────────
 
 @app.get("/downlink/guardian/health")
-def health_check():
+def health_check(current_user=Depends(auth.get_current_user)):
     """Check if the source Magistrala DB is reachable."""
     try:
         conn = get_source_conn()
@@ -3353,7 +3350,7 @@ def health_check():
 # ── Internal Backup (source → target) ──────────────────
 
 @app.post("/downlink/guardian/backup")
-def backup():
+def backup(current_user=Depends(auth.get_current_user)):
     """Run incremental sync from source to target DB."""
     start = datetime.now(timezone.utc)
     try:
@@ -3416,8 +3413,9 @@ def restore(
     limit: int | None = Query(
         default=None,
         gt=0,
-        description="Restore latest N records. If omitted, full restore.",
+        description="Restore latest N records. If omitted, full restore."
     ),
+    current_user=Depends(auth.get_current_user)
 ):
     """Restore from target DB back to source. Optionally limit to N records."""
     try:
@@ -3453,6 +3451,7 @@ def restore(
 @app.post("/downlink/guardian/restore/time")
 def restore_by_time(
     hours: int = Query(..., gt=0, description="Number of hours to restore"),
+    current_user=Depends(auth.get_current_user)
 ):
     """Restore the last N hours of data from target → source."""
     try:
@@ -3483,7 +3482,7 @@ def restore_by_time(
 
 
 @app.post("/downlink/guardian/restore/range")
-def restore_by_range(req: DateRangeRequest):
+def restore_by_range(req: DateRangeRequest, current_user=Depends(auth.get_current_user)):
     """Restore rows in a date range from Backup DB → Production DB."""
     try:
         try:
@@ -3566,7 +3565,7 @@ def restore_by_range(req: DateRangeRequest):
 # ── Backup control ─────────────────────────────────────
 
 @app.get("/downlink/guardian/backup/status")
-def backup_status():
+def backup_status(current_user=Depends(auth.get_current_user)):
     """Check whether backup is currently enabled or disabled."""
     try:
         with managed_conn(get_target_conn) as (_conn, cur):
@@ -3596,7 +3595,7 @@ def backup_status():
 
 
 @app.post("/downlink/guardian/backup/enable")
-def enable_backup():
+def enable_backup(current_user=Depends(auth.get_current_user)):
     """Enable the backup flag so sync runs will proceed."""
     try:
         with managed_conn(get_target_conn) as (conn, cur):
@@ -3622,7 +3621,7 @@ def enable_backup():
 
 
 @app.post("/downlink/guardian/backup/disable")
-def disable_backup():
+def disable_backup(current_user=Depends(auth.get_current_user)):
     """Disable the backup flag so sync runs will be skipped."""
     try:
         with managed_conn(get_target_conn) as (conn, cur):
@@ -3656,6 +3655,7 @@ def reset_watermark(
         description="Reset watermark to this UTC datetime (ISO format: 2026-01-01T00:00:00). "
                     "Omit to reset to beginning (full re-sync).",
     ),
+    current_user=Depends(auth.get_current_user)
 ):
     """
     Reset the incremental sync watermark.
@@ -3697,7 +3697,7 @@ def reset_watermark(
 # ── Scheduled backup ───────────────────────────────────
 
 @app.post("/downlink/guardian/backup/schedule")
-def set_backup_schedule(req: ScheduleRequest):
+def set_backup_schedule(req: ScheduleRequest, current_user=Depends(auth.get_current_user)):
     """Schedule a daily automatic backup at the specified time. Survives API restarts."""
     if not _SCHEDULER_AVAILABLE:
         raise HTTPException(
@@ -3747,7 +3747,7 @@ def set_backup_schedule(req: ScheduleRequest):
 
 
 @app.get("/downlink/guardian/backup/schedule")
-def get_backup_schedule():
+def get_backup_schedule(current_user=Depends(auth.get_current_user)):
     """Return the current backup schedule, or indicate none is set."""
     if not _SCHEDULER_AVAILABLE:
         raise HTTPException(
@@ -3775,7 +3775,7 @@ def get_backup_schedule():
 
 
 @app.delete("/downlink/guardian/backup/schedule")
-def delete_backup_schedule():
+def delete_backup_schedule(current_user=Depends(auth.get_current_user)):
     """Remove the scheduled backup."""
     if not _SCHEDULER_AVAILABLE:
         raise HTTPException(
@@ -3794,7 +3794,7 @@ def delete_backup_schedule():
 # ── NAS backup schedule ────────────────────────────────
 
 @app.post("/downlink/guardian/nas-backup/schedule")
-def set_nas_schedule(req: NasScheduleRequest):
+def set_nas_schedule(req: NasScheduleRequest, current_user=Depends(auth.get_current_user)):
     """Schedule a daily automatic NAS export at the specified time."""
     if not _SCHEDULER_AVAILABLE:
         raise HTTPException(
@@ -3829,6 +3829,7 @@ def set_nas_schedule(req: NasScheduleRequest):
             req.time, req.timezone,
             req.host, req.port, req.username, req.password, req.remote_path,
         )
+        enc_password = base64.b64encode(encrypt(req.password.encode(), load_key())).decode()
         with open(NAS_SCHEDULE_FILE, "w") as f:
             json.dump({
                 "time": req.time,
@@ -3836,7 +3837,7 @@ def set_nas_schedule(req: NasScheduleRequest):
                 "host": req.host,
                 "port": req.port,
                 "username": req.username,
-                "password": req.password,
+                "password": enc_password,
                 "remote_path": req.remote_path,
                 "user_id": req.user_id,
             }, f, indent=2)
@@ -3857,7 +3858,7 @@ def set_nas_schedule(req: NasScheduleRequest):
 
 
 @app.get("/downlink/guardian/nas-backup/schedule")
-def get_nas_schedule():
+def get_nas_schedule(current_user=Depends(auth.get_current_user)):
     """Return the current NAS backup schedule, or indicate none is set."""
     if not _SCHEDULER_AVAILABLE:
         raise HTTPException(
@@ -3887,7 +3888,7 @@ def get_nas_schedule():
 
 
 @app.delete("/downlink/guardian/nas-backup/schedule")
-def delete_nas_schedule():
+def delete_nas_schedule(current_user=Depends(auth.get_current_user)):
     """Remove the scheduled NAS backup."""
     if not _SCHEDULER_AVAILABLE:
         raise HTTPException(
@@ -3906,7 +3907,7 @@ def delete_nas_schedule():
 # ── Counts & metadata ──────────────────────────────────
 
 @app.get("/downlink/guardian/backup/sync-status")
-def sync_status():
+def sync_status(current_user=Depends(auth.get_current_user)):
     """Compare Production DB vs Backup DB row counts and show sync state."""
     try:
         with managed_conn(get_source_conn) as (_conn, cur):
@@ -3962,7 +3963,7 @@ def sync_status():
 
 
 @app.get("/downlink/guardian/backup-db/health")
-def backup_db_health():
+def backup_db_health(current_user=Depends(auth.get_current_user)):
     """Check if the Backup DB (TimescaleDB) is reachable."""
     try:
         with managed_conn(get_target_conn) as (_conn, cur):
@@ -3976,7 +3977,7 @@ def backup_db_health():
 
 
 @app.get("/downlink/guardian/backup/history")
-def backup_history():
+def backup_history(current_user=Depends(auth.get_current_user)):
     """Return last 100 backup run records (newest first)."""
     if not os.path.exists(BACKUP_HISTORY_FILE):
         return {"total": 0, "history": []}
@@ -3989,7 +3990,7 @@ def backup_history():
 
 
 @app.get("/downlink/guardian/nas/history")
-def nas_history():
+def nas_history(current_user=Depends(auth.get_current_user)):
     """Return last 100 NAS export run records (newest first)."""
     if not os.path.exists(NAS_HISTORY_FILE):
         return {"total": 0, "history": []}
@@ -4002,7 +4003,7 @@ def nas_history():
 
 
 @app.get("/downlink/guardian/nas-config")
-def get_nas_configs():
+def get_nas_configs(current_user=Depends(auth.get_current_user)):
     """Return all saved NAS server configs sorted by last used (newest first)."""
     configs = list(_load_nas_configs().values())
     configs.sort(key=lambda x: x.get("last_used", ""), reverse=True)
@@ -4010,7 +4011,7 @@ def get_nas_configs():
 
 
 @app.get("/downlink/guardian/backup/last")
-def last_sync_info():
+def last_sync_info(current_user=Depends(auth.get_current_user)):
     """Return the last sync watermark timestamp."""
     try:
         with managed_conn(get_target_conn) as (_conn, cur):
@@ -4042,7 +4043,7 @@ def last_sync_info():
 # ── Secure export (Production DB → AES-256-GCM → SHA256 → SFTP → External Server) ──
 
 @app.post("/downlink/guardian/secure-export")
-def api_secure_export(remote: RemoteConfig):
+def api_secure_export(remote: RemoteConfig, current_user=Depends(auth.get_current_user)):
     """
     Encrypt all messages with AES-256-GCM, generate SHA256 checksum per batch,
     and transfer to any external server via SFTP.
@@ -4084,7 +4085,7 @@ def api_secure_export(remote: RemoteConfig):
 # ── Secure import → Backup DB (External Server → Verify SHA256 → Decrypt → TimescaleDB) ──
 
 @app.post("/downlink/guardian/secure-import/backup-db")
-def api_secure_import_backup(remote: RemoteConfig):
+def api_secure_import_backup(remote: RemoteConfig, current_user=Depends(auth.get_current_user)):
     """
     Download encrypted batches from external server, verify SHA256 integrity,
     decrypt with AES-256-GCM, and insert into TimescaleDB (backup DB).
@@ -4107,7 +4108,7 @@ def api_secure_import_backup(remote: RemoteConfig):
 # ── Secure import → Production DB (External Server → Verify SHA256 → Decrypt → Magistrala) ──
 
 @app.post("/downlink/guardian/secure-import/production-db")
-def api_secure_import_production(remote: RemoteConfig):
+def api_secure_import_production(remote: RemoteConfig, current_user=Depends(auth.get_current_user)):
     """
     Download encrypted batches from external server, verify SHA256 integrity,
     decrypt with AES-256-GCM, and insert into Production DB (magistrala).
@@ -4138,7 +4139,7 @@ class ListExportsRequest(BaseModel):
 
 
 @app.post("/downlink/guardian/secure-export/list")
-def api_list_exports(req: ListExportsRequest):
+def api_list_exports(req: ListExportsRequest, current_user=Depends(auth.get_current_user)):
     """
     List all export folders under remote_path, with date, row count and batch count
     from each manifest.json. Use the returned export_path to pass into import or preview.
@@ -4216,7 +4217,7 @@ class PreviewRequest(BaseModel):
 
 
 @app.post("/downlink/guardian/secure-export/preview")
-def api_preview_batch(req: PreviewRequest):
+def api_preview_batch(req: PreviewRequest, current_user=Depends(auth.get_current_user)):
     """
     Download a single encrypted batch from the remote server, verify SHA256,
     decrypt, and return up to N rows as JSON — no DB write.

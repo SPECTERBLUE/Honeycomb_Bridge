@@ -47,7 +47,7 @@ def sha256_hex(data: bytes) -> str:
 def sftp_connect(host: str, port: int, username: str, password: str):
     """Open SSH + SFTP connection. Returns (ssh_client, sftp_client)."""
     ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
     ssh.connect(
         host,
         port=port,

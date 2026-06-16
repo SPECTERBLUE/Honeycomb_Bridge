@@ -320,10 +320,15 @@ if _AVAILABLE:
             try:
                 with open(NAS_SCHEDULE_FILE) as f:
                     saved = json.load(f)
+                import base64
+                sys.path.insert(0, _HERE)
+                from transfer_utils import decrypt, load_key
+                raw_pw = base64.b64decode(saved["password"])
+                password = decrypt(raw_pw, load_key()).decode()
                 apply_nas_schedule(
                     saved["time"], saved.get("timezone", "UTC"),
                     saved["host"], saved["port"],
-                    saved["username"], saved["password"],
+                    saved["username"], password,
                     saved["remote_path"],
                 )
                 _log.info(
