@@ -16,7 +16,7 @@ logger = logging.getLogger("sync")
 
 
 def sync_messages():
-    start_time = datetime.now()
+    start_time = datetime.now(timezone.utc)
     logger.info(f"🚀 Sync started at: {start_time}")
 
     src_conn = get_source_conn()
@@ -44,7 +44,11 @@ def sync_messages():
         last_sync = tgt_cur.fetchone()[0]
 
         if last_sync:
-            last_sync_epoch = int(last_sync.replace(tzinfo=timezone.utc).timestamp())
+            if last_sync.tzinfo is None:
+                last_sync = last_sync.replace(tzinfo=timezone.utc)
+            else:
+                last_sync = last_sync.astimezone(timezone.utc)
+            last_sync_epoch = int(last_sync.timestamp())
         else:
             last_sync_epoch = None
 
@@ -159,7 +163,7 @@ def sync_messages():
             processed_batch = []
             for row in batch:
                 epoch_val = row[-1]
-                ts_val = datetime.fromtimestamp(epoch_val, timezone.utc)
+                ts_val = datetime.fromtimestamp(epoch_val, timezone.utc) if epoch_val is not None else datetime.now(timezone.utc)
                 processed_batch.append(tuple(list(row[:-1]) + [ts_val]))
 
             execute_batch(tgt_cur, insert_sql, processed_batch)
@@ -209,7 +213,7 @@ def sync_messages():
 
         logger.info("Metadata updated successfully.")
 
-        end_time = datetime.now()
+        end_time = datetime.now(timezone.utc)
         duration = (end_time - start_time).total_seconds()
 
         logger.info("✅ Sync completed")
@@ -217,7 +221,7 @@ def sync_messages():
         logger.info(f"Rows upserted: {inserted}")
         logger.info(f"Duration: {duration:.2f}s")
 
-    except Exception as e:
+    except Exception:
         logger.exception("❌ Sync FAILED")
         tgt_conn.rollback()
         raise

@@ -11,8 +11,7 @@ inserting into the source DB.
 """
 import logging
 import sys
-from datetime import datetime
-
+from datetime import datetime, timezone
 from psycopg2.extras import execute_batch
 
 from db_config import get_source_conn, get_target_conn
@@ -43,7 +42,7 @@ if "--limit" in sys.argv:
 
 
 def restore_messages(hours=None):
-    start_time = datetime.now()
+    start_time = datetime.now(timezone.utc)
     total_fetched = 0
     total_inserted = 0
 
@@ -133,7 +132,7 @@ def restore_messages(hours=None):
             total_inserted += len(buffer)
 
         # ── Summary ────────────────────────────────────────
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (datetime.now(timezone.utc) - start_time).total_seconds()
         logger.info("Reverse Sync Summary")
         logger.info(f"  Mode             : {mode}")
         logger.info(f"  Records fetched  : {total_fetched}")

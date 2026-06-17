@@ -51,7 +51,7 @@ import io
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
-
+import gzip
 import psycopg2
 from fastapi import FastAPI, HTTPException, Query, status
 from psycopg2.extras import execute_batch
@@ -72,21 +72,21 @@ from captcha_utils import (
 
 from backup_scheduler import (
     _AVAILABLE as _SCHEDULER_AVAILABLE,
-    _append_history,
     _scheduler,
     apply_schedule as _apply_schedule,
     apply_nas_schedule as _apply_nas_schedule,
     start_backup_scheduler,
     SCHEDULE_FILE,
     NAS_SCHEDULE_FILE,
+    NAS_HISTORY_FILE,
+    BACKUP_HISTORY_FILE
 )
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 SYNC_SCRIPT = os.path.join(_HERE, "Timescale_db", "sync.py")
 REVERSE_SYNC_SCRIPT = os.path.join(_HERE, "Timescale_db", "reverse_sync.py")
 NAS_CONFIG_FILE = os.path.join(_HERE, "Timescale_db", "nas_config.json")
-BACKUP_HISTORY_FILE = os.path.join(_HERE, "backup_history.json")
-NAS_HISTORY_FILE = os.path.join(_HERE, "nas_history.json")
+_history_lock = threading.Lock()
 _HISTORY_MAX = 1000
 
 # Configure logging
@@ -3234,6 +3234,20 @@ async def get_gpu_info(current_user=Depends(auth.get_current_user)):
         raise HTTPException(status_code=500, detail="Failed to get GPU information")
     
 ########################################################################## BACKUP INTEGRATION ##########################################################################
+def _append_history(file_path: str, entry: dict) -> None:
+    try:
+        with _history_lock:
+            history = []
+            if os.path.exists(file_path):
+                with open(file_path) as f:
+                    history = json.load(f)
+            history.append(entry)
+            if len(history) > _HISTORY_MAX:
+                history = history[-_HISTORY_MAX:]
+            with open(file_path, "w") as f:
+                json.dump(history, f, indent=2)
+    except Exception as e:
+        logging.warning(f"Failed to append history to {file_path}: {e}")
 
 def _save_nas_config(host: str, port: int, username: str, remote_path: str) -> None:
     """Save or update a NAS server entry in nas_config.json (no password stored)."""
@@ -3251,8 +3265,8 @@ def _save_nas_config(host: str, port: int, username: str, remote_path: str) -> N
         configs[key] = entry
         with open(NAS_CONFIG_FILE, "w") as f:
             json.dump(list(configs.values()), f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"Failed to save NAS config: {e}")
 
 
 def _load_nas_configs() -> dict:
@@ -3283,6 +3297,9 @@ def managed_conn(conn_fn):
 
 def _run_script(command: list[str]) -> str:
     """Run a Python script and return combined stdout+stderr. Raises on failure."""
+    script = command[1] if len(command) > 1 else command[0]
+    if not os.path.exists(script):
+        raise RuntimeError(f"Script not found: {script}")
     result = subprocess.run(
         command,
         capture_output=True,
@@ -3364,8 +3381,8 @@ def backup(current_user=Depends(auth.get_current_user)):
             with managed_conn(get_target_conn) as (_conn, cur):
                 cur.execute("SELECT COUNT(*) FROM messages")
                 backup_count = cur.fetchone()[0]
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Failed to retrieve row counts: {e}")
         _append_history(BACKUP_HISTORY_FILE, {
             "start_time": start.isoformat(),
             "status": "SUCCESS",
@@ -3393,6 +3410,7 @@ def backup(current_user=Depends(auth.get_current_user)):
             detail=str(pe),
         )
     except Exception as e:
+        logging.warning(f"Unexpected error occurred: {e}")
         _append_history(BACKUP_HISTORY_FILE, {
             "start_time": start.isoformat(),
             "status": "FAILED",
@@ -3533,7 +3551,7 @@ def restore_by_range(req: DateRangeRequest, current_user=Depends(auth.get_curren
                 for r in rows:
                     row = list(r)
                     # update_time is TIMESTAMP in backup DB — convert to epoch for production
-                    row[-1] = row[-1].timestamp() if row[-1] else None
+                    row[-1] = row[-1].timestamp() if row[-1] is not None else None
                     batch.append(tuple(row))
                 execute_batch(src_cur, insert_sql, batch)
                 src_conn.commit()
@@ -3730,7 +3748,7 @@ def set_backup_schedule(req: ScheduleRequest, current_user=Depends(auth.get_curr
     try:
         _apply_schedule(req.time, req.timezone)
         with open(SCHEDULE_FILE, "w") as f:
-            json.dump({"time": req.time, "timezone": req.timezone, "user_id": req.user_id}, f, indent=2)
+            json.dump({"time": req.time, "timezone": req.timezone, "user_id": current_user.id}, f, indent=2)
 
         job = _scheduler.get_job("daily_backup")
         next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
@@ -3787,7 +3805,10 @@ def delete_backup_schedule(current_user=Depends(auth.get_current_user)):
     if job:
         _scheduler.remove_job("daily_backup")
     if os.path.exists(SCHEDULE_FILE):
-        os.remove(SCHEDULE_FILE)
+        try:
+            os.remove(SCHEDULE_FILE)
+        except OSError as e:
+            logging.warning(f"Could not remove schedule file: {e}")
     return {"status": "Schedule removed"}
 
 
@@ -3823,7 +3844,17 @@ def set_nas_schedule(req: NasScheduleRequest, current_user=Depends(auth.get_curr
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unknown timezone '{req.timezone}'. Use IANA name e.g. UTC, Asia/Kolkata, America/New_York",
         )
-
+        
+    try:
+        ssh, sftp = sftp_connect(req.host, req.port, req.username, req.password)
+        sftp.close()
+        ssh.close()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"SSH connection test failed: {e}",
+        )
+        
     try:
         _apply_nas_schedule(
             req.time, req.timezone,
@@ -3839,7 +3870,7 @@ def set_nas_schedule(req: NasScheduleRequest, current_user=Depends(auth.get_curr
                 "username": req.username,
                 "password": enc_password,
                 "remote_path": req.remote_path,
-                "user_id": req.user_id,
+                "user_id": current_user.id,
             }, f, indent=2)
 
         job = _scheduler.get_job("daily_nas_backup")
@@ -3900,7 +3931,10 @@ def delete_nas_schedule(current_user=Depends(auth.get_current_user)):
     if job:
         _scheduler.remove_job("daily_nas_backup")
     if os.path.exists(NAS_SCHEDULE_FILE):
-        os.remove(NAS_SCHEDULE_FILE)
+        try:
+            os.remove(NAS_SCHEDULE_FILE)
+        except OSError as e:
+            logging.warning(f"Could not remove NAS schedule file: {e}")
     return {"status": "NAS schedule removed"}
 
 
@@ -3977,27 +4011,29 @@ def backup_db_health(current_user=Depends(auth.get_current_user)):
 
 
 @app.get("/downlink/guardian/backup/history")
-def backup_history(current_user=Depends(auth.get_current_user)):
-    """Return last 100 backup run records (newest first)."""
+def backup_history(limit: int = Query(default=20, ge=1, le=1000), current_user=Depends(auth.get_current_user)):
+    """Return last N backup run records (newest first). Default 20, max 1000."""
     if not os.path.exists(BACKUP_HISTORY_FILE):
         return {"total": 0, "history": []}
     try:
         with open(BACKUP_HISTORY_FILE) as f:
             history = json.load(f)
-        return {"total": len(history), "history": list(reversed(history))}
+        records = list(reversed(history))[:limit]
+        return {"total": len(records), "history": records}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 @app.get("/downlink/guardian/nas/history")
-def nas_history(current_user=Depends(auth.get_current_user)):
-    """Return last 100 NAS export run records (newest first)."""
+def nas_history(limit: int = Query(default=20, ge=1, le=1000), current_user=Depends(auth.get_current_user)):
+    """Return last N NAS export run records (newest first). Default 20, max 1000."""
     if not os.path.exists(NAS_HISTORY_FILE):
         return {"total": 0, "history": []}
     try:
         with open(NAS_HISTORY_FILE) as f:
             history = json.load(f)
-        return {"total": len(history), "history": list(reversed(history))}
+        records = list(reversed(history))[:limit]
+        return {"total": len(records), "history": records}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
@@ -4146,35 +4182,21 @@ def api_list_exports(req: ListExportsRequest, current_user=Depends(auth.get_curr
     """
     try:
         ssh, sftp = sftp_connect(req.host, req.port, req.username, req.password)
-
-        try:
-            entries = sftp.listdir_attr(req.remote_path)
-        finally:
-            sftp.close()
-            ssh.close()
-
-        # Only include export_* subdirectories
-        export_dirs = sorted(
-            [e.filename for e in entries if e.filename.startswith("export_")],
-            reverse=True,  # newest first
-        )
-
-        if not export_dirs:
-            return {"total": 0, "exports": []}
-
-        # Read each manifest to get metadata
-        ssh, sftp = sftp_connect(req.host, req.port, req.username, req.password)
         exports = []
 
         try:
+            entries = sftp.listdir_attr(req.remote_path)
+            export_dirs = sorted(
+                [e.filename for e in entries if e.filename.startswith("export_")],
+                reverse=True,
+            )
+
             for folder in export_dirs:
                 full_path = f"{req.remote_path.rstrip('/')}/{folder}"
                 manifest_path = f"{full_path}/manifest.json"
-
                 try:
                     with sftp.open(manifest_path, "r") as f:
                         manifest = json.load(f)
-
                     exports.append({
                         "folder": folder,
                         "export_path": full_path,
@@ -4183,7 +4205,6 @@ def api_list_exports(req: ListExportsRequest, current_user=Depends(auth.get_curr
                         "total_batches": manifest.get("total_batches"),
                     })
                 except Exception:
-                    # Folder exists but manifest missing or unreadable — skip
                     exports.append({
                         "folder": folder,
                         "export_path": full_path,
@@ -4202,7 +4223,6 @@ def api_list_exports(req: ListExportsRequest, current_user=Depends(auth.get_curr
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-
 
 # ── Preview encrypted batch from NAS (no DB write) ─────────────────────────
 
@@ -4259,7 +4279,7 @@ def api_preview_batch(req: PreviewRequest, current_user=Depends(auth.get_current
             )
 
         # Decrypt
-        plaintext = decrypt(encrypted, key)
+        plaintext = gzip.decompress(decrypt(encrypted, key))
         reader = csv.DictReader(io.StringIO(plaintext.decode("utf-8")))
         rows = [dict(r) for _, r in zip(range(req.rows), reader)]
 

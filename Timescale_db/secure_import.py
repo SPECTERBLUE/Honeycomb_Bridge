@@ -92,7 +92,7 @@ def _parse_for_target(row: dict) -> tuple:
     """CSV row dict → tuple for TimescaleDB. update_time as TIMESTAMP (datetime)."""
     base = list(_parse_for_source(row))
     epoch = base[12]
-    base[12] = datetime.fromtimestamp(epoch, timezone.utc) if epoch else datetime.now(timezone.utc)
+    base[12] = datetime.fromtimestamp(epoch, timezone.utc) if epoch is not None else datetime.now(timezone.utc)
     return tuple(base)
 
 

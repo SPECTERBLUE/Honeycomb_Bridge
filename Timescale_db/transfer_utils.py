@@ -74,4 +74,7 @@ def sftp_ensure_dir(sftp: paramiko.SFTPClient, path: str) -> None:
     parent = path.rstrip("/").rsplit("/", 1)[0]
     if parent and parent != path:
         sftp_ensure_dir(sftp, parent)
-    sftp.mkdir(path)
+    try:
+        sftp.mkdir(path)
+    except IOError:
+        pass  # created by another process between stat and mkdir

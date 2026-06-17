@@ -75,8 +75,8 @@ timescale-db-new/
 ├── schedule.json          # Auto-created when a schedule is set — persists across restarts
 ├── nas_config.json        # Auto-created on first export — saves NAS server details (no passwords)
 ├── nas_schedule.json      # Auto-created when NAS schedule is set — includes SSH credentials
-├── backup_history.json    # Auto-created — last 100 backup run records
-├── nas_history.json       # Auto-created — last 100 NAS export run records
+├── backup_history.json    # Auto-created — last 1000 backup run records
+├── nas_history.json       # Auto-created — last 1000 NAS export run records
 ├── .env                   # Environment variables — DB credentials, encryption key, alert email
 ├── docker-compose.yaml    # TimescaleDB container
 └── initdb/
@@ -146,7 +146,6 @@ pip install python-dotenv
 from dotenv import load_dotenv
 load_dotenv()
 ```
-
 
 **Integrated into your main server (`main.py`):**
 
@@ -219,8 +218,8 @@ All endpoints are prefixed with `/downlink/guardian`.
 |--------|----------|-------------|
 | GET | `/downlink/guardian/backup/sync-status` | Compare Production vs Backup DB counts, show diff and next schedule |
 | GET | `/downlink/guardian/backup/last` | Last sync watermark timestamp |
-| GET | `/downlink/guardian/backup/history` | Last 100 backup run records (start time, status, duration, counts) |
-| GET | `/downlink/guardian/nas/history` | Last 100 NAS export run records (start time, status, duration, rows) |
+| GET | `/downlink/guardian/backup/history?limit=20` | Backup run records, newest first (default 20, max 1000) |
+| GET | `/downlink/guardian/nas/history?limit=20` | NAS export run records, newest first (default 20, max 1000) |
 
 ### Secure External Transfer
 

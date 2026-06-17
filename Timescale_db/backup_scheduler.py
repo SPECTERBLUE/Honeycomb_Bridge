@@ -10,12 +10,14 @@ BACKUP_ALERT_EMAIL env var is set to override the recipient.
 """
 
 import atexit
+import base64
 import json
 import logging
 import os
 import smtplib
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
 
@@ -27,12 +29,20 @@ except ImportError:
     _AVAILABLE = False
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import psycopg2
+from db_config import APP_DB_URL, SOURCE_DB, TARGET_DB
+from secure_export import secure_export
+from transfer_utils import decrypt, load_key
+
 SCHEDULE_FILE = os.path.join(_HERE, "schedule.json")
 NAS_SCHEDULE_FILE = os.path.join(_HERE, "nas_schedule.json")
 SYNC_SCRIPT = os.path.join(_HERE, "sync.py")
 BACKUP_HISTORY_FILE = os.path.join(_HERE, "backup_history.json")
 NAS_HISTORY_FILE = os.path.join(_HERE, "nas_history.json")
-_HISTORY_MAX = 100
+_HISTORY_MAX = 1000
 
 
 def _append_history(file_path: str, entry: dict) -> None:
@@ -89,9 +99,6 @@ def _get_alert_emails(schedule_file: str = None) -> list[str]:
             _log.warning(f"No user_id in {os.path.basename(schedule_file)} — cannot determine alert recipient")
             return []
 
-        import psycopg2
-        sys.path.insert(0, _HERE)
-        from db_config import APP_DB_URL
         if not APP_DB_URL:
             raise RuntimeError("DATABASE_URL env var is not set")
         conn = psycopg2.connect(APP_DB_URL)
@@ -137,15 +144,14 @@ if _AVAILABLE:
     _scheduler = BackgroundScheduler(daemon=True)
 
     def _run_job():
-        import time as _time
         start_ts = datetime.now(timezone.utc)
-        start_wall = _time.monotonic()
+        start_wall = time.monotonic()
         try:
             result = subprocess.run(
                 [sys.executable, SYNC_SCRIPT],
                 capture_output=True, text=True, timeout=3600,
             )
-            duration = round(_time.monotonic() - start_wall, 2)
+            duration = round(time.monotonic() - start_wall, 2)
             output = (result.stdout + result.stderr).strip()
             if result.returncode != 0:
                 _log.error(f"Scheduled backup FAILED:\n{output}")
@@ -175,19 +181,18 @@ if _AVAILABLE:
                 _log.info(f"Scheduled backup completed:\n{output}")
                 source_count, backup_count = None, None
                 try:
-                    import psycopg2
-                    sys.path.insert(0, _HERE)
-                    from db_config import SOURCE_DB, TARGET_DB
                     src = psycopg2.connect(**SOURCE_DB)
                     src_cur = src.cursor()
                     src_cur.execute("SELECT COUNT(*) FROM messages")
                     source_count = src_cur.fetchone()[0]
-                    src_cur.close(); src.close()
+                    src_cur.close()
+                    src.close()
                     tgt = psycopg2.connect(**TARGET_DB)
                     tgt_cur = tgt.cursor()
                     tgt_cur.execute("SELECT COUNT(*) FROM messages")
                     backup_count = tgt_cur.fetchone()[0]
-                    tgt_cur.close(); tgt.close()
+                    tgt_cur.close()
+                    tgt.close()
                 except Exception:
                     pass
                 _append_history(BACKUP_HISTORY_FILE, {
@@ -198,7 +203,7 @@ if _AVAILABLE:
                     "backup_count": backup_count,
                 })
         except Exception as exc:
-            duration = round(_time.monotonic() - start_wall, 2)
+            duration = round(time.monotonic() - start_wall, 2)
             _log.error(f"Scheduled backup exception: {exc}")
             _append_history(BACKUP_HISTORY_FILE, {
                 "start_time": start_ts.isoformat(),
@@ -239,18 +244,16 @@ if _AVAILABLE:
         h, m = map(int, time_str.split(":"))
 
         def _run_nas_job():
-            import time as _time
+
             start_ts = datetime.now(timezone.utc)
-            start_wall = _time.monotonic()
+            start_wall = time.monotonic()
             try:
-                sys.path.insert(0, _HERE)
-                from secure_export import secure_export
                 result = secure_export(
                     host=host, port=port,
                     username=username, password=password,
                     remote_path=remote_path,
                 )
-                duration = round(_time.monotonic() - start_wall, 2)
+                duration = round(time.monotonic() - start_wall, 2)
                 _log.info(f"Scheduled NAS backup completed: {result}")
                 _append_history(NAS_HISTORY_FILE, {
                     "start_time": start_ts.isoformat(),
@@ -261,7 +264,7 @@ if _AVAILABLE:
                     "target": f"{username}@{host}:{port}{remote_path}",
                 })
             except Exception as exc:
-                duration = round(_time.monotonic() - start_wall, 2)
+                duration = round(time.monotonic() - start_wall, 2)
                 _log.error(f"Scheduled NAS backup FAILED: {exc}")
                 _append_history(NAS_HISTORY_FILE, {
                     "start_time": start_ts.isoformat(),
@@ -320,9 +323,6 @@ if _AVAILABLE:
             try:
                 with open(NAS_SCHEDULE_FILE) as f:
                     saved = json.load(f)
-                import base64
-                sys.path.insert(0, _HERE)
-                from transfer_utils import decrypt, load_key
                 raw_pw = base64.b64decode(saved["password"])
                 password = decrypt(raw_pw, load_key()).decode()
                 apply_nas_schedule(
