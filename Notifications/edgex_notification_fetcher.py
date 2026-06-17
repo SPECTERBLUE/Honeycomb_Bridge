@@ -12,7 +12,7 @@ from Notifications.db_notification.crud import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-notification_url = "http://localhost:59860/support-notifications/api/v3/notification/status/PROCESSED"
+notification_url = "http://localhost:59860/api/v3/notification/status/PROCESSED"
 
 
 def fetch_notifications(token, limit=500, offset=0):

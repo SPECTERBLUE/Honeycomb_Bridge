@@ -46,6 +46,21 @@ from Notifications.worker import run_notification_worker
 from Notifications.db_notification.models import Notification, NotificationAction
 from Notifications.schema import CloseNotificationRequest, NotificationResponse
 from Notifications.db_notification.crud import get_notifications, get_last_notification_timestamp, close_notification, get_notifications_by_status
+import csv
+import io
+import sys
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import gzip
+import psycopg2
+from fastapi import FastAPI, HTTPException, Query, status
+from psycopg2.extras import execute_batch
+
+from db_config import get_source_conn, get_target_conn
+from Timescale_db.secure_export import secure_export
+from Timescale_db.secure_import import COLUMNS, secure_import
+from transfer_utils import decrypt, encrypt, load_key, sftp_connect, sha256_hex
+
 from captcha_utils import (
     encrypt_aes_gcm_downlink_login,
     redis_client,
@@ -54,6 +69,25 @@ from captcha_utils import (
     decrypt_aes_gcm,
     decrypt_aes_gcm_downlink_login
 )
+
+from backup_scheduler import (
+    _AVAILABLE as _SCHEDULER_AVAILABLE,
+    _scheduler,
+    apply_schedule as _apply_schedule,
+    apply_nas_schedule as _apply_nas_schedule,
+    start_backup_scheduler,
+    SCHEDULE_FILE,
+    NAS_SCHEDULE_FILE,
+    NAS_HISTORY_FILE,
+    BACKUP_HISTORY_FILE
+)
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+SYNC_SCRIPT = os.path.join(_HERE, "Timescale_db", "sync.py")
+REVERSE_SYNC_SCRIPT = os.path.join(_HERE, "Timescale_db", "reverse_sync.py")
+NAS_CONFIG_FILE = os.path.join(_HERE, "Timescale_db", "nas_config.json")
+_history_lock = threading.Lock()
+_HISTORY_MAX = 1000
 
 # Configure logging
 logging.basicConfig(level=logging.ERROR)
@@ -3198,3 +3232,1069 @@ async def get_gpu_info(current_user=Depends(auth.get_current_user)):
     except Exception as e:
         logging.error(f"Failed to get GPU info: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to get GPU information")
+    
+########################################################################## BACKUP INTEGRATION ##########################################################################
+def _append_history(file_path: str, entry: dict) -> None:
+    try:
+        with _history_lock:
+            history = []
+            if os.path.exists(file_path):
+                with open(file_path) as f:
+                    history = json.load(f)
+            history.append(entry)
+            if len(history) > _HISTORY_MAX:
+                history = history[-_HISTORY_MAX:]
+            with open(file_path, "w") as f:
+                json.dump(history, f, indent=2)
+    except Exception as e:
+        logging.warning(f"Failed to append history to {file_path}: {e}")
+
+def _save_nas_config(host: str, port: int, username: str, remote_path: str) -> None:
+    """Save or update a NAS server entry in nas_config.json (no password stored)."""
+    try:
+        configs = _load_nas_configs()
+        key = f"{host}:{port}:{remote_path}"
+        entry = {
+            "host": host,
+            "port": port,
+            "username": username,
+            "remote_path": remote_path,
+            "last_used": datetime.now(timezone.utc).isoformat(),
+        }
+        configs = {k: v for k, v in configs.items() if k != key}
+        configs[key] = entry
+        with open(NAS_CONFIG_FILE, "w") as f:
+            json.dump(list(configs.values()), f, indent=2)
+    except Exception as e:
+        logging.warning(f"Failed to save NAS config: {e}")
+
+
+def _load_nas_configs() -> dict:
+    """Return saved NAS configs keyed by host:port."""
+    if not os.path.exists(NAS_CONFIG_FILE):
+        return {}
+    try:
+        with open(NAS_CONFIG_FILE) as f:
+            entries = json.load(f)
+        return {f"{e['host']}:{e['port']}:{e['remote_path']}": e for e in entries}
+    except Exception:
+        return {}
+    
+    
+# ── Helpers ─────────────────────────────────────────────
+
+@contextmanager
+def managed_conn(conn_fn):
+    """Context manager that guarantees cursor + connection cleanup."""
+    conn = conn_fn()
+    cur = conn.cursor()
+    try:
+        yield conn, cur
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _run_script(command: list[str]) -> str:
+    """Run a Python script and return combined stdout+stderr. Raises on failure."""
+    script = command[1] if len(command) > 1 else command[0]
+    if not os.path.exists(script):
+        raise RuntimeError(f"Script not found: {script}")
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=3600,
+    )
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        raise RuntimeError(output)
+    return output
+
+
+# ── Pydantic models ─────────────────────────────────────
+
+class RemoteConfig(BaseModel):
+    host: str = Field(..., description="Remote server hostname or IP address")
+    port: int = Field(22, ge=1, le=65535, description="SSH port")
+    username: str = Field(..., description="SSH username")
+    password: str = Field(..., description="SSH password")
+    remote_path: str = Field(..., description="Absolute path on remote server for backup files")
+
+
+class DateRangeRequest(BaseModel):
+    start: str = Field(..., description="Start datetime (ISO format, UTC) e.g. 2026-06-06T00:00:00")
+    end: str = Field(..., description="End datetime (ISO format, UTC) e.g. 2026-06-07T23:59:59")
+
+
+class ScheduleRequest(BaseModel):
+    time: str = Field(..., description="Daily backup time in HH:MM format (24-hour)")
+    timezone: str = Field("UTC", description="IANA timezone name e.g. UTC, Asia/Kolkata, America/New_York")
+
+
+class NasScheduleRequest(BaseModel):
+    time: str = Field(..., description="Daily NAS backup time in HH:MM format (24-hour)")
+    timezone: str = Field("UTC", description="IANA timezone name e.g. UTC, Asia/Kolkata, America/New_York")
+    host: str = Field(..., description="NAS / SSH server hostname or IP")
+    port: int = Field(22, description="SSH port")
+    username: str = Field(..., description="SSH username")
+    password: str = Field(..., description="SSH password — stored on server for scheduled runs")
+    remote_path: str = Field(..., description="Base folder on NAS for exports")
+
+
+# ── Health ──────────────────────────────────────────────
+
+@app.get("/downlink/guardian/health")
+def health_check(current_user=Depends(auth.get_current_user)):
+    """Check if the source Magistrala DB is reachable."""
+    try:
+        conn = get_source_conn()
+        conn.close()
+        return {"status": "UP", "message": "Magistrala DB is reachable"}
+
+    except psycopg2.OperationalError as oe:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(oe),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal Server Error: {e}",
+        )
+
+
+# ── Internal Backup (source → target) ──────────────────
+
+@app.post("/downlink/guardian/backup")
+def backup(current_user=Depends(auth.get_current_user)):
+    """Run incremental sync from source to target DB."""
+    start = datetime.now(timezone.utc)
+    try:
+        output = _run_script([sys.executable, SYNC_SCRIPT])
+        duration = round((datetime.now(timezone.utc) - start).total_seconds(), 2)
+        source_count, backup_count = None, None
+        try:
+            with managed_conn(get_source_conn) as (_conn, cur):
+                cur.execute("SELECT COUNT(*) FROM messages")
+                source_count = cur.fetchone()[0]
+            with managed_conn(get_target_conn) as (_conn, cur):
+                cur.execute("SELECT COUNT(*) FROM messages")
+                backup_count = cur.fetchone()[0]
+        except Exception as e:
+            logging.warning(f"Failed to retrieve row counts: {e}")
+        _append_history(BACKUP_HISTORY_FILE, {
+            "start_time": start.isoformat(),
+            "status": "SUCCESS",
+            "duration_seconds": duration,
+            "source_count": source_count,
+            "backup_count": backup_count,
+        })
+        return {"status": "SUCCESS", "output": output}
+
+    except subprocess.TimeoutExpired:
+        _append_history(BACKUP_HISTORY_FILE, {
+            "start_time": start.isoformat(),
+            "status": "FAILED",
+            "duration_seconds": round((datetime.now(timezone.utc) - start).total_seconds(), 2),
+            "source_count": None,
+            "backup_count": None,
+        })
+        raise HTTPException(
+            status_code=status.HTTP_408_REQUEST_TIMEOUT,
+            detail="Sync process timed out",
+        )
+    except PermissionError as pe:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(pe),
+        )
+    except Exception as e:
+        logging.warning(f"Unexpected error occurred: {e}")
+        _append_history(BACKUP_HISTORY_FILE, {
+            "start_time": start.isoformat(),
+            "status": "FAILED",
+            "duration_seconds": round((datetime.now(timezone.utc) - start).total_seconds(), 2),
+            "source_count": None,
+            "backup_count": None,
+        })
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal Server Error: {e}",
+        )
+
+
+# ── Internal Restore (target → source) ─────────────────
+
+@app.post("/downlink/guardian/restore")
+def restore(
+    limit: int | None = Query(
+        default=None,
+        gt=0,
+        description="Restore latest N records. If omitted, full restore."
+    ),
+    current_user=Depends(auth.get_current_user)
+):
+    """Restore from target DB back to source. Optionally limit to N records."""
+    try:
+        command = [sys.executable, REVERSE_SYNC_SCRIPT]
+        if limit is not None:
+            command.extend(["--limit", str(limit)])
+
+        output = _run_script(command)
+
+        return {
+            "status": "SUCCESS",
+            "mode": "FULL_RESTORE" if limit is None else f"LAST_{limit}_RECORDS",
+            "output": output,
+        }
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=status.HTTP_408_REQUEST_TIMEOUT,
+            detail="Restore process timed out",
+        )
+    except PermissionError as pe:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(pe),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal Server Error: {e}",
+        )
+
+
+@app.post("/downlink/guardian/restore/time")
+def restore_by_time(
+    hours: int = Query(..., gt=0, description="Number of hours to restore"),
+    current_user=Depends(auth.get_current_user)
+):
+    """Restore the last N hours of data from target → source."""
+    try:
+        output = _run_script([sys.executable, REVERSE_SYNC_SCRIPT, str(hours)])
+
+        return {
+            "status": "SUCCESS",
+            "hours": hours,
+            "message": f"Restore completed for last {hours} hours",
+            "output": output,
+        }
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=status.HTTP_408_REQUEST_TIMEOUT,
+            detail="Restore process timed out",
+        )
+    except PermissionError as pe:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(pe),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal Server Error: {e}",
+        )
+
+
+@app.post("/downlink/guardian/restore/range")
+def restore_by_range(req: DateRangeRequest, current_user=Depends(auth.get_current_user)):
+    """Restore rows in a date range from Backup DB → Production DB."""
+    try:
+        try:
+            def _to_utc(s: str) -> datetime:
+                dt = datetime.fromisoformat(s)
+                return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            start_dt = _to_utc(req.start)
+            end_dt = _to_utc(req.end)
+        except ValueError as e:
+            raise ValueError(f"Invalid datetime: {e}. Use ISO format e.g. 2026-06-06T00:00:00")
+
+        if start_dt >= end_dt:
+            raise ValueError("start must be before end")
+
+        src_conn = get_source_conn()
+        tgt_conn = get_target_conn()
+        src_cur = src_conn.cursor()
+        tgt_cur = tgt_conn.cursor(name="range_restore_cursor")
+
+        try:
+            tgt_cur.execute("""
+                SELECT time, channel, subtopic, publisher, protocol,
+                       name, unit, value, string_value, bool_value,
+                       data_value, sum, update_time
+                FROM messages
+                WHERE update_time >= %s AND update_time <= %s
+                ORDER BY update_time
+            """, (start_dt, end_dt))
+
+            insert_sql = """
+                INSERT INTO messages (
+                    time, channel, subtopic, publisher, protocol,
+                    name, unit, value, string_value, bool_value,
+                    data_value, sum, update_time
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (time, publisher, subtopic, name) DO NOTHING
+            """
+
+            total_fetched = 0
+            total_inserted = 0
+
+            while True:
+                rows = tgt_cur.fetchmany(10000)
+                if not rows:
+                    break
+                total_fetched += len(rows)
+                batch = []
+                for r in rows:
+                    row = list(r)
+                    # update_time is TIMESTAMP in backup DB — convert to epoch for production
+                    row[-1] = row[-1].timestamp() if row[-1] is not None else None
+                    batch.append(tuple(row))
+                execute_batch(src_cur, insert_sql, batch)
+                src_conn.commit()
+                total_inserted += len(batch)
+
+        finally:
+            tgt_cur.close()
+            src_cur.close()
+            tgt_conn.close()
+            src_conn.close()
+
+        return {
+            "status": "SUCCESS",
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+            "rows_found": total_fetched,
+            "rows_inserted": total_inserted,
+        }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal Server Error: {e}",
+        )
+
+
+# ── Backup control ─────────────────────────────────────
+
+@app.get("/downlink/guardian/backup/status")
+def backup_status(current_user=Depends(auth.get_current_user)):
+    """Check whether backup is currently enabled or disabled."""
+    try:
+        with managed_conn(get_target_conn) as (_conn, cur):
+            cur.execute("SELECT enabled FROM backup_control WHERE id = TRUE")
+            row = cur.fetchone()
+
+            if not row:
+                raise ValueError("backup_control row not found")
+
+            return {"backup_enabled": row[0]}
+
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve),
+        )
+    except psycopg2.Error as pe:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(pe),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal Server Error: {e}",
+        )
+
+
+@app.post("/downlink/guardian/backup/enable")
+def enable_backup(current_user=Depends(auth.get_current_user)):
+    """Enable the backup flag so sync runs will proceed."""
+    try:
+        with managed_conn(get_target_conn) as (conn, cur):
+            cur.execute("""
+                UPDATE backup_control
+                SET enabled = TRUE, updated_at = now()
+                WHERE id = TRUE
+            """)
+            conn.commit()
+
+        return {"status": "Backup enabled"}
+
+    except psycopg2.Error as pe:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(pe),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal Server Error: {e}",
+        )
+
+
+@app.post("/downlink/guardian/backup/disable")
+def disable_backup(current_user=Depends(auth.get_current_user)):
+    """Disable the backup flag so sync runs will be skipped."""
+    try:
+        with managed_conn(get_target_conn) as (conn, cur):
+            cur.execute("""
+                UPDATE backup_control
+                SET enabled = FALSE, updated_at = now()
+                WHERE id = TRUE
+            """)
+            conn.commit()
+
+        return {"status": "Backup disabled"}
+
+    except psycopg2.Error as pe:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(pe),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal Server Error: {e}",
+        )
+
+
+# ── Watermark reset ────────────────────────────────────
+
+@app.post("/downlink/guardian/backup/reset-watermark")
+def reset_watermark(
+    from_time: str | None = Query(
+        default=None,
+        description="Reset watermark to this UTC datetime (ISO format: 2026-01-01T00:00:00). "
+                    "Omit to reset to beginning (full re-sync).",
+    ),
+    current_user=Depends(auth.get_current_user)
+):
+    """
+    Reset the incremental sync watermark.
+    Use this if the backup DB crashes and loses data — the next /backup run
+    will re-sync from the specified time (or from the very beginning if omitted).
+    """
+    try:
+        if from_time is not None:
+            try:
+                reset_ts = datetime.fromisoformat(from_time).replace(tzinfo=timezone.utc)
+            except ValueError:
+                raise ValueError(f"Invalid datetime format: '{from_time}'. Use ISO format e.g. 2026-01-01T00:00:00")
+        else:
+            reset_ts = datetime(1970, 1, 1, tzinfo=timezone.utc)  # full re-sync from beginning
+
+        with managed_conn(get_target_conn) as (conn, cur):
+            cur.execute("""
+                UPDATE backup_metadata
+                SET last_message_time = %s,
+                    last_synced_time  = NULL
+                WHERE id = TRUE
+            """, (reset_ts,))
+            conn.commit()
+
+        return {
+            "status": "Watermark reset",
+            "last_message_time": reset_ts.isoformat(),
+            "note": "Next /downlink/backup run will re-sync all rows after this time",
+        }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except psycopg2.Error as pe:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(pe))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal Server Error: {e}")
+
+
+# ── Scheduled backup ───────────────────────────────────
+
+@app.post("/downlink/guardian/backup/schedule")
+def set_backup_schedule(req: ScheduleRequest, current_user=Depends(auth.get_current_user)):
+    """Schedule a daily automatic backup at the specified time. Survives API restarts."""
+    if not _SCHEDULER_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="APScheduler not installed. Run: pip install apscheduler",
+        )
+
+    parts = req.time.split(":")
+    try:
+        if len(parts) != 2:
+            raise ValueError
+        h, m = int(parts[0]), int(parts[1])
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid time '{req.time}': use HH:MM (24-hour, e.g. 23:30)",
+        )
+
+    try:
+        import zoneinfo
+        zoneinfo.ZoneInfo(req.timezone)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown timezone '{req.timezone}'. Use IANA name e.g. UTC, Asia/Kolkata, America/New_York",
+        )
+
+    try:
+        _apply_schedule(req.time, req.timezone)
+        with open(SCHEDULE_FILE, "w") as f:
+            json.dump({"time": req.time, "timezone": req.timezone, "user_id": current_user.id}, f, indent=2)
+
+        job = _scheduler.get_job("daily_backup")
+        next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+
+        return {
+            "status": "Scheduled",
+            "time": req.time,
+            "timezone": req.timezone,
+            "next_run": next_run,
+            "note": "Backup runs daily at the specified time. Persisted — survives API restarts.",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@app.get("/downlink/guardian/backup/schedule")
+def get_backup_schedule(current_user=Depends(auth.get_current_user)):
+    """Return the current backup schedule, or indicate none is set."""
+    if not _SCHEDULER_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="APScheduler not installed. Run: pip install apscheduler",
+        )
+
+    job = _scheduler.get_job("daily_backup")
+    if not job:
+        return {"scheduled": False, "schedule": None, "next_run": None}
+
+    schedule_data = None
+    if os.path.exists(SCHEDULE_FILE):
+        try:
+            with open(SCHEDULE_FILE) as f:
+                schedule_data = json.load(f)
+        except Exception:
+            pass
+
+    return {
+        "scheduled": True,
+        "schedule": schedule_data,
+        "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+    }
+
+
+@app.delete("/downlink/guardian/backup/schedule")
+def delete_backup_schedule(current_user=Depends(auth.get_current_user)):
+    """Remove the scheduled backup."""
+    if not _SCHEDULER_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="APScheduler not installed. Run: pip install apscheduler",
+        )
+
+    job = _scheduler.get_job("daily_backup")
+    if job:
+        _scheduler.remove_job("daily_backup")
+    if os.path.exists(SCHEDULE_FILE):
+        try:
+            os.remove(SCHEDULE_FILE)
+        except OSError as e:
+            logging.warning(f"Could not remove schedule file: {e}")
+    return {"status": "Schedule removed"}
+
+
+# ── NAS backup schedule ────────────────────────────────
+
+@app.post("/downlink/guardian/nas-backup/schedule")
+def set_nas_schedule(req: NasScheduleRequest, current_user=Depends(auth.get_current_user)):
+    """Schedule a daily automatic NAS export at the specified time."""
+    if not _SCHEDULER_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="APScheduler not installed. Run: pip install apscheduler",
+        )
+
+    parts = req.time.split(":")
+    try:
+        if len(parts) != 2:
+            raise ValueError
+        h, m = int(parts[0]), int(parts[1])
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid time '{req.time}': use HH:MM (24-hour, e.g. 23:30)",
+        )
+
+    try:
+        import zoneinfo
+        zoneinfo.ZoneInfo(req.timezone)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown timezone '{req.timezone}'. Use IANA name e.g. UTC, Asia/Kolkata, America/New_York",
+        )
+        
+    try:
+        ssh, sftp = sftp_connect(req.host, req.port, req.username, req.password)
+        sftp.close()
+        ssh.close()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"SSH connection test failed: {e}",
+        )
+        
+    try:
+        _apply_nas_schedule(
+            req.time, req.timezone,
+            req.host, req.port, req.username, req.password, req.remote_path,
+        )
+        enc_password = base64.b64encode(encrypt(req.password.encode(), load_key())).decode()
+        with open(NAS_SCHEDULE_FILE, "w") as f:
+            json.dump({
+                "time": req.time,
+                "timezone": req.timezone,
+                "host": req.host,
+                "port": req.port,
+                "username": req.username,
+                "password": enc_password,
+                "remote_path": req.remote_path,
+                "user_id": current_user.id,
+            }, f, indent=2)
+
+        job = _scheduler.get_job("daily_nas_backup")
+        next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+
+        return {
+            "status": "Scheduled",
+            "time": req.time,
+            "timezone": req.timezone,
+            "target": f"{req.username}@{req.host}:{req.port}{req.remote_path}",
+            "next_run": next_run,
+            "note": "NAS export runs daily at the specified time. Persisted — survives API restarts.",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@app.get("/downlink/guardian/nas-backup/schedule")
+def get_nas_schedule(current_user=Depends(auth.get_current_user)):
+    """Return the current NAS backup schedule, or indicate none is set."""
+    if not _SCHEDULER_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="APScheduler not installed. Run: pip install apscheduler",
+        )
+
+    job = _scheduler.get_job("daily_nas_backup")
+    if not job:
+        return {"scheduled": False, "schedule": None, "next_run": None}
+
+    schedule_data = None
+    if os.path.exists(NAS_SCHEDULE_FILE):
+        try:
+            with open(NAS_SCHEDULE_FILE) as f:
+                saved = json.load(f)
+            # never expose password in response
+            schedule_data = {k: v for k, v in saved.items() if k != "password"}
+        except Exception:
+            pass
+
+    return {
+        "scheduled": True,
+        "schedule": schedule_data,
+        "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+    }
+
+
+@app.delete("/downlink/guardian/nas-backup/schedule")
+def delete_nas_schedule(current_user=Depends(auth.get_current_user)):
+    """Remove the scheduled NAS backup."""
+    if not _SCHEDULER_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="APScheduler not installed. Run: pip install apscheduler",
+        )
+
+    job = _scheduler.get_job("daily_nas_backup")
+    if job:
+        _scheduler.remove_job("daily_nas_backup")
+    if os.path.exists(NAS_SCHEDULE_FILE):
+        try:
+            os.remove(NAS_SCHEDULE_FILE)
+        except OSError as e:
+            logging.warning(f"Could not remove NAS schedule file: {e}")
+    return {"status": "NAS schedule removed"}
+
+
+# ── Counts & metadata ──────────────────────────────────
+
+@app.get("/downlink/guardian/backup/sync-status")
+def sync_status(current_user=Depends(auth.get_current_user)):
+    """Compare Production DB vs Backup DB row counts and show sync state."""
+    try:
+        with managed_conn(get_source_conn) as (_conn, cur):
+            cur.execute("SELECT COUNT(*) FROM messages")
+            production_count = cur.fetchone()[0]
+
+        with managed_conn(get_target_conn) as (_conn, cur):
+            cur.execute("SELECT COUNT(*) FROM messages")
+            backup_count = cur.fetchone()[0]
+
+        difference = production_count - backup_count
+        in_sync = difference == 0
+
+        next_run = None
+        if _SCHEDULER_AVAILABLE and _scheduler and _scheduler.running:
+            job = _scheduler.get_job("daily_backup")
+            if job and job.next_run_time:
+                next_run = job.next_run_time.isoformat()
+
+        if in_sync:
+            message = "Backup is up to date."
+        elif next_run:
+            message = (
+                f"Backup is out of sync by {difference:,} rows. "
+                f"Next auto-backup scheduled at {next_run}. "
+                f"To sync now: POST /downlink/backup."
+            )
+        else:
+            message = (
+                f"Backup is out of sync by {difference:,} rows. "
+                f"No schedule set — sync manually via POST /downlink/backup."
+            )
+
+        return {
+            "production_count": production_count,
+            "backup_count": backup_count,
+            "difference": difference,
+            "in_sync": in_sync,
+            "next_scheduled_backup": next_run,
+            "message": message,
+        }
+
+    except psycopg2.Error as pe:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(pe),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal Server Error: {e}",
+        )
+
+
+@app.get("/downlink/guardian/backup-db/health")
+def backup_db_health(current_user=Depends(auth.get_current_user)):
+    """Check if the Backup DB (TimescaleDB) is reachable."""
+    try:
+        with managed_conn(get_target_conn) as (_conn, cur):
+            cur.execute("SELECT 1")
+        return {"status": "UP", "message": "Backup DB (TimescaleDB) is reachable"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(e),
+        )
+
+
+@app.get("/downlink/guardian/backup/history")
+def backup_history(limit: int = Query(default=20, ge=1, le=1000), current_user=Depends(auth.get_current_user)):
+    """Return last N backup run records (newest first). Default 20, max 1000."""
+    if not os.path.exists(BACKUP_HISTORY_FILE):
+        return {"total": 0, "history": []}
+    try:
+        with open(BACKUP_HISTORY_FILE) as f:
+            history = json.load(f)
+        records = list(reversed(history))[:limit]
+        return {"total": len(records), "history": records}
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@app.get("/downlink/guardian/nas/history")
+def nas_history(limit: int = Query(default=20, ge=1, le=1000), current_user=Depends(auth.get_current_user)):
+    """Return last N NAS export run records (newest first). Default 20, max 1000."""
+    if not os.path.exists(NAS_HISTORY_FILE):
+        return {"total": 0, "history": []}
+    try:
+        with open(NAS_HISTORY_FILE) as f:
+            history = json.load(f)
+        records = list(reversed(history))[:limit]
+        return {"total": len(records), "history": records}
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@app.get("/downlink/guardian/nas-config")
+def get_nas_configs(current_user=Depends(auth.get_current_user)):
+    """Return all saved NAS server configs sorted by last used (newest first)."""
+    configs = list(_load_nas_configs().values())
+    configs.sort(key=lambda x: x.get("last_used", ""), reverse=True)
+    return {"total": len(configs), "servers": configs}
+
+
+@app.get("/downlink/guardian/backup/last")
+def last_sync_info(current_user=Depends(auth.get_current_user)):
+    """Return the last sync watermark timestamp."""
+    try:
+        with managed_conn(get_target_conn) as (_conn, cur):
+            cur.execute("SELECT last_synced_time FROM backup_metadata WHERE id = TRUE")
+            row = cur.fetchone()
+
+            if not row:
+                raise ValueError("backup_metadata row not found")
+
+            return {"last_synced_time": row[0].isoformat() if row[0] else None}
+
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve),
+        )
+    except psycopg2.Error as pe:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(pe),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal Server Error: {e}",
+        )
+
+
+# ── Secure export (Production DB → AES-256-GCM → SHA256 → SFTP → External Server) ──
+
+@app.post("/downlink/guardian/secure-export")
+def api_secure_export(remote: RemoteConfig, current_user=Depends(auth.get_current_user)):
+    """
+    Encrypt all messages with AES-256-GCM, generate SHA256 checksum per batch,
+    and transfer to any external server via SFTP.
+    Requires BACKUP_ENCRYPTION_KEY env var on the server.
+    """
+    start = datetime.now(timezone.utc)
+    try:
+        result = secure_export(
+            host=remote.host,
+            port=remote.port,
+            username=remote.username,
+            password=remote.password,
+            remote_path=remote.remote_path,
+        )
+        _save_nas_config(remote.host, remote.port, remote.username, remote.remote_path)
+        _append_history(NAS_HISTORY_FILE, {
+            "start_time": start.isoformat(),
+            "status": "SUCCESS",
+            "duration_seconds": result.get("duration_seconds"),
+            "total_rows": result.get("total_rows"),
+            "total_batches": result.get("total_batches"),
+            "target": f"{remote.username}@{remote.host}:{remote.port}{remote.remote_path}",
+        })
+        return result
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except Exception as e:
+        _append_history(NAS_HISTORY_FILE, {
+            "start_time": start.isoformat(),
+            "status": "FAILED",
+            "duration_seconds": round((datetime.now(timezone.utc) - start).total_seconds(), 2),
+            "total_rows": None,
+            "total_batches": None,
+            "target": f"{remote.username}@{remote.host}:{remote.port}{remote.remote_path}",
+        })
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ── Secure import → Backup DB (External Server → Verify SHA256 → Decrypt → TimescaleDB) ──
+
+@app.post("/downlink/guardian/secure-import/backup-db")
+def api_secure_import_backup(remote: RemoteConfig, current_user=Depends(auth.get_current_user)):
+    """
+    Download encrypted batches from external server, verify SHA256 integrity,
+    decrypt with AES-256-GCM, and insert into TimescaleDB (backup DB).
+    """
+    try:
+        return secure_import(
+            host=remote.host,
+            port=remote.port,
+            username=remote.username,
+            password=remote.password,
+            remote_path=remote.remote_path,
+            target="backup",
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ── Secure import → Production DB (External Server → Verify SHA256 → Decrypt → Magistrala) ──
+
+@app.post("/downlink/guardian/secure-import/production-db")
+def api_secure_import_production(remote: RemoteConfig, current_user=Depends(auth.get_current_user)):
+    """
+    Download encrypted batches from external server, verify SHA256 integrity,
+    decrypt with AES-256-GCM, and insert into Production DB (magistrala).
+    """
+    try:
+        return secure_import(
+            host=remote.host,
+            port=remote.port,
+            username=remote.username,
+            password=remote.password,
+            remote_path=remote.remote_path,
+            target="production",
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ── List all exports on NAS ─────────────────────────────────────────────────
+
+class ListExportsRequest(BaseModel):
+    host: str = Field(..., description="Remote server hostname or IP address")
+    port: int = Field(22, ge=1, le=65535, description="SSH port")
+    username: str = Field(..., description="SSH username")
+    password: str = Field(..., description="SSH password")
+    remote_path: str = Field(..., description="Base backup folder on remote server")
+
+
+@app.post("/downlink/guardian/secure-export/list")
+def api_list_exports(req: ListExportsRequest, current_user=Depends(auth.get_current_user)):
+    """
+    List all export folders under remote_path, with date, row count and batch count
+    from each manifest.json. Use the returned export_path to pass into import or preview.
+    """
+    try:
+        ssh, sftp = sftp_connect(req.host, req.port, req.username, req.password)
+        exports = []
+
+        try:
+            entries = sftp.listdir_attr(req.remote_path)
+            export_dirs = sorted(
+                [e.filename for e in entries if e.filename.startswith("export_")],
+                reverse=True,
+            )
+
+            for folder in export_dirs:
+                full_path = f"{req.remote_path.rstrip('/')}/{folder}"
+                manifest_path = f"{full_path}/manifest.json"
+                try:
+                    with sftp.open(manifest_path, "r") as f:
+                        manifest = json.load(f)
+                    exports.append({
+                        "folder": folder,
+                        "export_path": full_path,
+                        "exported_at": manifest.get("exported_at"),
+                        "total_rows": manifest.get("total_rows"),
+                        "total_batches": manifest.get("total_batches"),
+                    })
+                except Exception:
+                    exports.append({
+                        "folder": folder,
+                        "export_path": full_path,
+                        "exported_at": None,
+                        "total_rows": None,
+                        "total_batches": None,
+                        "note": "manifest.json missing or unreadable",
+                    })
+        finally:
+            sftp.close()
+            ssh.close()
+
+        return {"total": len(exports), "exports": exports}
+
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+# ── Preview encrypted batch from NAS (no DB write) ─────────────────────────
+
+class PreviewRequest(BaseModel):
+    host: str = Field(..., description="Remote server hostname or IP address")
+    port: int = Field(22, ge=1, le=65535, description="SSH port")
+    username: str = Field(..., description="SSH username")
+    password: str = Field(..., description="SSH password")
+    remote_path: str = Field(..., description="Folder on remote server containing the backup")
+    batch: int = Field(0, ge=0, description="Batch index to preview (0-based)")
+    rows: int = Field(10, ge=1, le=1000, description="Number of rows to return")
+
+
+@app.post("/downlink/guardian/secure-export/preview")
+def api_preview_batch(req: PreviewRequest, current_user=Depends(auth.get_current_user)):
+    """
+    Download a single encrypted batch from the remote server, verify SHA256,
+    decrypt, and return up to N rows as JSON — no DB write.
+    Useful for inspecting what is stored on the NAS.
+    """
+    try:
+        key = load_key()
+        ssh, sftp = sftp_connect(req.host, req.port, req.username, req.password)
+
+        try:
+            # Read manifest to get checksum for the requested batch
+            with sftp.open(f"{req.remote_path}/manifest.json", "r") as f:
+                manifest = json.load(f)
+
+            batches = manifest.get("batches", [])
+            if req.batch >= len(batches):
+                raise ValueError(
+                    f"Batch {req.batch} does not exist — "
+                    f"manifest has {len(batches)} batch(es) (0-based index)"
+                )
+
+            entry = batches[req.batch]
+            batch_file = entry["file"]
+            expected_checksum = entry["checksum"]
+
+            with sftp.open(f"{req.remote_path}/{batch_file}", "rb") as f:
+                encrypted = f.read()
+
+        finally:
+            sftp.close()
+            ssh.close()
+
+        # Verify integrity
+        actual_checksum = sha256_hex(encrypted)
+        if actual_checksum != expected_checksum:
+            raise ValueError(
+                f"SHA256 mismatch on {batch_file}: "
+                f"expected {expected_checksum}, got {actual_checksum}"
+            )
+
+        # Decrypt
+        plaintext = gzip.decompress(decrypt(encrypted, key))
+        reader = csv.DictReader(io.StringIO(plaintext.decode("utf-8")))
+        rows = [dict(r) for _, r in zip(range(req.rows), reader)]
+
+        return {
+            "batch": req.batch,
+            "file": batch_file,
+            "total_rows_in_batch": entry["rows"],
+            "rows_returned": len(rows),
+            "checksum_verified": True,
+            "columns": COLUMNS,
+            "data": rows,
+        }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
