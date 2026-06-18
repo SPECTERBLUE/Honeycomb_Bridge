@@ -1,87 +1,154 @@
 
-# ChirpStack gRPC Configuration
-CHIRPSTACK_HOST = "localhost:8088"  # Ensure this is the correct ChirpStack gRPC server address
-API_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJjaGlycHN0YWNrIiwiaXNzIjoiY2hpcnBzdGFjayIsInN1YiI6IjY4N2JkYjA2LTFmNTgtNGQ5ZS05MmMzLTNlZGNlMDQ2YzZjMCIsInR5cCI6ImtleSJ9.g5aP9FJrT-3ImHC1I1U0HiItxgD8JBp8mzm-wsrTgQI"  # Replace with your API token
+# =============================================================================
+#  APPLICATION CONFIGURATION
+#  Central config file — all URLs, keys, ports, and service settings live here.
+#  Edit this file to point the application at different environments or services.
+# =============================================================================
 
-# Not needed
-APPLICATION_ID = None  # Remove hardcoded Application ID
-TENANT_ID = None  # Replace with your tenant ID
-USER_ID = None # Replace with your user ID 
 
-# Pagination Configuration
-MAX_DEVICES = 1000
-MAX_APPLICATIONS = 1000
-MAX_TENANTS = 100
-LIMIT = 100
-OFFSET = 0
+# -----------------------------------------------------------------------------
+#  ChirpStack — gRPC & HTTP
+# -----------------------------------------------------------------------------
 
-# mqtt
-mqtt = "localhost"
-keepalive = 60
+CHIRPSTACK_HOST         = "localhost:8088"          # gRPC server address
+CHIRPSTACK_HTTP_BASE_URL = "http://localhost:8090"   # HTTP REST API base URL
+API_TOKEN               = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJjaGlycHN0YWNrIiwiaXNzIjoiY2hpcnBzdGFjayIsInN1YiI6IjQ2ZjU4ZGI4LWY2MDUtNGI5MC1iYThkLWJkMjI3M2Q4YzIxOSIsInR5cCI6ImtleSJ9.vn5K_yZJ-fTRKQOmiZIQlKoGDFHV5W7NaaagK3PucGE"  # ChirpStack API token (replace when rotated)
 
-# Add authorization metadata
+# Authorization metadata header for gRPC calls
 AUTH_METADATA = [("authorization", f"Bearer {API_TOKEN}")]
 
-#Automatic Key Rotation Configuration
-AUTO_KEY_ROTATION_TIME = 30 * 24 * 60 * 60  # Time in seconds for automatic key rotation
+# -----------------------------------------------------------------------------
+#  ChirpStack — IDs (set at runtime / via admin panel; None = not configured)
+# -----------------------------------------------------------------------------
 
-# Join based key rotation
-JOIN_SIMULATED_TIME_DELAY = 0.5 * 60  # Time in seconds to simulate join delay
+APPLICATION_ID = None   # ChirpStack Application ID
+TENANT_ID      = None   # ChirpStack Tenant ID
+USER_ID        = None   # ChirpStack User ID
 
-#Uplink Configuration fports
+
+# -----------------------------------------------------------------------------
+#  Pagination defaults
+# -----------------------------------------------------------------------------
+
+MAX_DEVICES      = 1000
+MAX_APPLICATIONS = 1000
+MAX_TENANTS      = 100
+LIMIT            = 100
+OFFSET           = 0
+
+
+# -----------------------------------------------------------------------------
+#  MQTT Broker
+# -----------------------------------------------------------------------------
+
+mqtt      = "localhost"
+keepalive = 60          # Keep-alive interval in seconds
+
+
+# -----------------------------------------------------------------------------
+#  Service Base URLs  (localhost — change to remote host/IP for production)
+# -----------------------------------------------------------------------------
+
+BASE_URL                  = "http://localhost:80"     # Magistrala / main gateway - https://iot.meridiandatalabs.com/
+USERS_SERVICE_URL         = "http://localhost:9002"   # Magistrala user service (password reset etc.) - https://iot.meridiandatalabs.com/
+EDGEX_VAULT_BASE_URL      = "http://localhost:8200"   # EdgeX Vault (JWT / OIDC token endpoint) - https://rapid.meridiandatalabs.com/vault/
+EDGEX_NOTIFICATION_BASE_URL = "http://localhost:59860" # EdgeX notification service - https://rapid.meridiandatalabs.com/support-notifications/
+SUPERSET_BASE_URL         = "http://localhost:8018"   # Apache Superset dashboard - https://superset.meridiandatalabs.com/
+
+# -----------------------------------------------------------------------------
+#  External / Cloud Service URLs
+# -----------------------------------------------------------------------------
+
+RULES_ENGINE_BASE_URL = "https://edge.meridiandatalabs.com/rules-engine"  # MDL Rules Engine REST API
+FRONTEND_URL = "https://honeycomb.meridiandatalabs.com/auth"  # Frontend app (used in reset-link emails)
+
+
+
+# -----------------------------------------------------------------------------
+#  Docker Container Names  (used with `docker exec` commands)
+# -----------------------------------------------------------------------------
+
+CONTAINER_EDGEX_SECURITY_PROXY = "edgex-security-proxy-setup"      # EdgeX user/password management
+CONTAINER_CHIRPSTACK           = "chirpstack-chirpstack-1"          # ChirpStack CLI operations
+CONTAINER_VAULT                = "edgex-security-secretstore-setup" # Vault token config
+
+
+# -----------------------------------------------------------------------------
+#  Vault
+# -----------------------------------------------------------------------------
+
+VAULT_ROOT_PATH = "/vault/config/assets/resp-init.json"  # Path to Vault root-token JSON inside container
+
+
+# -----------------------------------------------------------------------------
+#  LoRaWAN fPort Definitions
+# -----------------------------------------------------------------------------
+
+# Uplink fPorts
 UL_ED_PUBLIC_KEY = 26
 
-# Downlink Configuration fports
-DL_UA_PUBLIC_KEY = 76
+# Downlink fPorts
+DL_UA_PUBLIC_KEY       = 76
 DL_KEYROTATION_SUCCESS = 10
-DL_REBOOT = 52
-DL_UPDATE_FREQUENCY = 51
-DL_DEVICE_STATUS = 55
-DL_LOG_LEVEL = 62
-DL_TIME_SYNC = 60
-DL_RESET_FACTORY = 61
+DL_REBOOT              = 52
+DL_UPDATE_FREQUENCY    = 51
+DL_DEVICE_STATUS       = 55
+DL_LOG_LEVEL           = 62
+DL_TIME_SYNC           = 60
+DL_RESET_FACTORY       = 61
 
-#API
-CONTAINER_EDGEX_SECURITY_PROXY = "edgex-security-proxy-setup"
-CONTAINER_CHIRPSTACK = "chirpstack-chirpstack-1"
-CONTAINER_VAULT = "edgex-security-secretstore-setup"
 
-VAULT_ROOT_PATH = "/vault/config/assets/resp-init.json"
+# -----------------------------------------------------------------------------
+#  Key Rotation Timings
+# -----------------------------------------------------------------------------
 
-# base url for user fetcher from honeycomb
-BASE_URL = "http://localhost:80"
+AUTO_KEY_ROTATION_TIME   = 30 * 24 * 60 * 60  # Automatic key rotation interval (30 days in seconds)
+JOIN_SIMULATED_TIME_DELAY = 0.5 * 60           # Simulated join delay for key rotation (30 seconds)
 
-# user credentials for honeycomb
-# Username = "admin@mdl.com"
-# Password = "grse2024"
 
+# -----------------------------------------------------------------------------
+#  Encryption Keys  (AES — keep secret, do not commit to public repos)
+# -----------------------------------------------------------------------------
+
+AES_KEY          = b"n2342dwwendwejnwedwjkdnwedne2dxn"   # AES-256 key for general encryption
+LOGIN_AESGCM_KEY = b"bR7xZ1qP8eWn4vFVS23KY92MuXqGdEL0"  # AES-GCM key for login credential encryption
+
+
+# -----------------------------------------------------------------------------
+#  Honeycomb Service Credentials  (encrypted — do not store plaintext here)
+#  These are AES-GCM encrypted payloads: { "iv", "ciphertext", "tag" }
+# -----------------------------------------------------------------------------
+
+# Encrypted username (admin@mdl.com)
 encrypted_user = {
-    "iv": "9HCBQdwicgPlsWr+",
+    "iv":         "9HCBQdwicgPlsWr+",
     "ciphertext": "wDWyk5/v6U+enmu8wQ==",
-    "tag": "fqRo3CMAQbuh0JPisFRvPw=="
+    "tag":        "fqRo3CMAQbuh0JPisFRvPw=="
 }
 
-# Store secret as a dict
+# Encrypted password (grse2024)
 encrypted_pass = {
-    "iv": "wJ5DJZP4RVcFjn+u",
+    "iv":         "wJ5DJZP4RVcFjn+u",
     "ciphertext": "NcvLKS4zmnE=",
-    "tag": "3t7ihXeewTFSjYYBEkRvWw=="
+    "tag":        "3t7ihXeewTFSjYYBEkRvWw=="
 }
 
-# Domain name  for honeycomb
+# Domain identifier for this deployment
 Domain = "GRSE"
 
-AES_KEY = b"n2342dwwendwejnwedwjkdnwedne2dxn"
-LOGIN_AESGCM_KEY = b"bR7xZ1qP8eWn4vFVS23KY92MuXqGdEL0"
 
-# SMTP Configuration
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-SMTP_USERNAME = "mihir.rayadurgam2002@gmail.com"
-SMTP_PASSWORD = "flng qger blhv pnph"
+# -----------------------------------------------------------------------------
+#  SMTP — Email / Alert Configuration
+# -----------------------------------------------------------------------------
 
-# reset password link
-FRONTEND_URL = "http://localhost:5173/auth"
+SMTP_SERVER   = "smtp.gmail.com"
+SMTP_PORT     = 587
+SMTP_USERNAME = "mdltest86@gmail.com"
+SMTP_PASSWORD = "bhew gqyo hfrv pqrk"   # App password (not account password)
 
-#semetric cyphering or asymmetric
-SYMETRIC_CYPHERING = True
+
+# -----------------------------------------------------------------------------
+#  Cyphering Mode
+# -----------------------------------------------------------------------------
+
+SYMETRIC_CYPHERING = True   # True = symmetric (AES), False = asymmetric

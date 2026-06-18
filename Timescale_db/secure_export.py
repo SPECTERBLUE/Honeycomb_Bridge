@@ -52,11 +52,14 @@ def _rows_to_csv(rows: list) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 
-def secure_export(host: str, port: int, username: str, password: str, remote_path: str) -> dict:
+def secure_export(host: str, port: int, username: str, password: str, remote_path: str,
+                  limit: int = None, hours: int = None,
+                  start_dt=None, end_dt=None) -> dict:
     """
-    Extract all messages from Production DB (magistrala), encrypt each batch of 10000
+    Extract messages from Production DB (magistrala), encrypt each batch of 10000
     rows with AES-256-GCM, generate a SHA256 checksum per batch, and SFTP the encrypted
     files plus a manifest.json to remote_path on the target server.
+    Filter params (mutually exclusive): limit, hours, or start_dt+end_dt. Default = full export.
     """
     key = load_key()
     started = datetime.now(timezone.utc)
@@ -71,10 +74,43 @@ def secure_export(host: str, port: int, username: str, password: str, remote_pat
     try:
         sftp_ensure_dir(sftp, export_dir)
 
-        cur.execute(f"SELECT {', '.join(COLUMNS)} FROM messages ORDER BY time")
+        col_list = ", ".join(COLUMNS)
+        if limit is not None:
+            cur.execute(f"""
+                SELECT * FROM (
+                    SELECT {col_list}
+                    FROM messages
+                    ORDER BY COALESCE(NULLIF(update_time, 0), time) DESC
+                    LIMIT %s
+                ) t ORDER BY COALESCE(NULLIF(update_time, 0), time)
+            """, (limit,))
+            export_mode = f"limit:{limit}"
+        elif hours is not None:
+            cutoff = int(started.timestamp()) - hours * 3600
+            cur.execute(f"""
+                SELECT {col_list}
+                FROM messages
+                WHERE COALESCE(NULLIF(update_time, 0), time) > %s
+                ORDER BY COALESCE(NULLIF(update_time, 0), time)
+            """, (cutoff,))
+            export_mode = f"hours:{hours}"
+        elif start_dt is not None and end_dt is not None:
+            start_epoch = int(start_dt.timestamp())
+            end_epoch = int(end_dt.timestamp())
+            cur.execute(f"""
+                SELECT {col_list}
+                FROM messages
+                WHERE COALESCE(NULLIF(update_time, 0), time) BETWEEN %s AND %s
+                ORDER BY COALESCE(NULLIF(update_time, 0), time)
+            """, (start_epoch, end_epoch))
+            export_mode = f"range:{start_dt.isoformat()}→{end_dt.isoformat()}"
+        else:
+            cur.execute(f"SELECT {col_list} FROM messages ORDER BY time")
+            export_mode = "full"
 
         manifest = {
             "exported_at": started.isoformat(),
+            "mode": export_mode,
             "total_rows": 0,
             "total_batches": 0,
             "batches": [],
@@ -123,6 +159,7 @@ def secure_export(host: str, port: int, username: str, password: str, remote_pat
 
         return {
             "status": "SUCCESS",
+            "mode": export_mode,
             "total_rows": total_rows,
             "total_batches": batch_idx,
             "duration_seconds": round(duration, 2),

@@ -135,9 +135,8 @@ def sync_messages():
                 %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s
             )
-            ON CONFLICT (time, channel, name) DO UPDATE SET
-                subtopic     = EXCLUDED.subtopic,
-                publisher    = EXCLUDED.publisher,
+            ON CONFLICT (time, publisher, subtopic, name) DO UPDATE SET
+                channel      = EXCLUDED.channel,
                 protocol     = EXCLUDED.protocol,
                 unit         = EXCLUDED.unit,
                 value        = EXCLUDED.value,

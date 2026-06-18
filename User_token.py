@@ -71,10 +71,10 @@ def update_user_list():
 
 
 EDGEX_USERS_FILE = "edgex_users.json"
-ADMIN_TOKEN_URL = "http://localhost:8200/v1/identity/oidc/token/admin"
-RULES_LIST_URL = "https://edge.meridiandatalabs.com/rules-engine/rules"
-RULE_DETAIL_URL_TEMPLATE = "https://edge.meridiandatalabs.com/rules-engine/rules/{rule_name}"
-RULE_UPDATE_URL_TEMPLATE = "https://edge.meridiandatalabs.com/rules-engine/rules/{rule_name}"
+ADMIN_TOKEN_URL = f"{config.EDGEX_VAULT_BASE_URL}/v1/identity/oidc/token/admin"
+RULES_LIST_URL = f"{config.RULES_ENGINE_BASE_URL}/rules"
+RULE_DETAIL_URL_TEMPLATE = f"{config.RULES_ENGINE_BASE_URL}/rules/{{rule_name}}"
+RULE_UPDATE_URL_TEMPLATE = f"{config.RULES_ENGINE_BASE_URL}/rules/{{rule_name}}"
 
 def JWT_token_generator():
     """Generates and uses JWT token for the admin user to fetch rules, modify Authorization, and update them."""
@@ -188,9 +188,9 @@ def chirpstack_auth_http_rotation(jwt):
         """
         Fetches HTTP integration details and updates the Authorization header.
         """
-        Chirpstack_tenant_url = "http://localhost:8090/api/tenants"
-        Chirpstack_application_url = "http://localhost:8090/api/applications"
-        Chirpstack_http_integration_url = "http://localhost:8090/api/applications/{application_id}/integrations/http"
+        Chirpstack_tenant_url = f"{config.CHIRPSTACK_HTTP_BASE_URL}/api/tenants"
+        Chirpstack_application_url = f"{config.CHIRPSTACK_HTTP_BASE_URL}/api/applications"
+        Chirpstack_http_integration_url = f"{config.CHIRPSTACK_HTTP_BASE_URL}/api/applications/{{application_id}}/integrations/http"
 
         try:
             parameters = {

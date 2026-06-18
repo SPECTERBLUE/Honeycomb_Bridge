@@ -2,6 +2,7 @@ from time import time
 from User_token import admin_JWT_token_generator
 import logging
 import requests
+import config
 from auth.database import SessionLocal
 
 from Notifications.db_notification.crud import (
@@ -12,7 +13,7 @@ from Notifications.db_notification.crud import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-notification_url = "http://localhost:59860/api/v3/notification/status/PROCESSED"
+notification_url = f"{config.EDGEX_NOTIFICATION_BASE_URL}/api/v3/notification/status/PROCESSED"
 
 
 def fetch_notifications(token, limit=500, offset=0):
