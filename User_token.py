@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 def update_user_list():
     """Main logic for user fetching and edgex_users.json maintenance."""
-    list_of_users = UserFetcher().fetch_all_vault_users()
+    list_of_users = UserFetcher().fetch_all_users_vault()
 
     users = list_of_users.get("users")
     if users and isinstance(users, list):
