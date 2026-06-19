@@ -58,7 +58,7 @@ from psycopg2.extras import execute_batch
 
 from db_config import get_source_conn, get_target_conn
 from Timescale_db.secure_export import secure_export
-from Timescale_db.secure_import import COLUMNS, secure_import
+from Timescale_db.secure_import import COLUMNS, secure_import, find_latest_export
 from transfer_utils import decrypt, encrypt, load_key, sftp_connect, sha256_hex
 
 from captcha_utils import (
@@ -75,16 +75,23 @@ from backup_scheduler import (
     _scheduler,
     apply_schedule as _apply_schedule,
     apply_nas_schedule as _apply_nas_schedule,
+    apply_restore_schedule as _apply_restore_schedule,
+    apply_import_schedule as _apply_import_schedule,
     start_backup_scheduler,
     SCHEDULE_FILE,
     NAS_SCHEDULE_FILE,
+    RESTORE_SCHEDULE_FILE,
+    IMPORT_BACKUP_SCHEDULE_FILE,
+    IMPORT_PRODUCTION_SCHEDULE_FILE,
+    IMPORT_BACKUP_HISTORY_FILE,
+    IMPORT_PRODUCTION_HISTORY_FILE,
     NAS_HISTORY_FILE,
-    BACKUP_HISTORY_FILE
+    BACKUP_HISTORY_FILE,
+    RESTORE_HISTORY_FILE,
 )
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 SYNC_SCRIPT = os.path.join(_HERE, "Timescale_db", "sync.py")
-REVERSE_SYNC_SCRIPT = os.path.join(_HERE, "Timescale_db", "reverse_sync.py")
 NAS_CONFIG_FILE = os.path.join(_HERE, "Timescale_db", "nas_config.json")
 _history_lock = threading.Lock()
 _HISTORY_MAX = 1000
@@ -599,7 +606,7 @@ def reset_password(req: ResetPasswordRequest, db: Session = Depends(get_db)):
 
     try:
         response = requests.post(
-            "http://localhost:9002/users/reset-without-token",
+            f"{config.USERS_SERVICE_URL}/users/reset-without-token",
             json=payload,
             timeout=10
         )
@@ -3033,9 +3040,9 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     magistrala_identity = encrypt_aes_gcm_downlink_login(username)  # Re-encrypt for magistrala
     magistrala_secret = encrypt_aes_gcm_downlink_login(password)  
     
-    magistrala_token_response = requests.post( 
-        "http://localhost:80/users/tokens/issue",
-        json ={ 
+    magistrala_token_response = requests.post(
+        f"{config.BASE_URL}/users/tokens/issue",
+        json ={
         "identity": magistrala_identity,
         "secret": magistrala_secret
     })
@@ -3073,7 +3080,7 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     # 8. get the JWT for edgex using the token and username
     
     JWT_responce_edgex = requests.get(
-        f"http://localhost:8200/v1/identity/oidc/token/{edgex_user}",
+        f"{config.EDGEX_VAULT_BASE_URL}/v1/identity/oidc/token/{edgex_user}",
         headers={"Authorization": f"Bearer {edgex_token}"}
     )
     if JWT_responce_edgex.status_code != 200:
@@ -3085,7 +3092,7 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     # 9. login for chirpstack and get the token
     
     chirpstack_login_response = requests.get(
-        "http://localhost:8090/api/tenants?limit=1&offset=0",
+        f"{config.CHIRPSTACK_HTTP_BASE_URL}/api/tenants?limit=1&offset=0",
         headers={"Authorization": f"Bearer {config.API_TOKEN}"}
     )
     if chirpstack_login_response.status_code != 200:
@@ -3108,7 +3115,7 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     superset_secret = f"{magistrala_secret['iv']}:{magistrala_secret['ciphertext']}:{magistrala_secret['tag']}"
     
     superset_login_response = requests.post(
-        "http://localhost:8018/api/v1/security/login",
+        f"{config.SUPERSET_BASE_URL}/api/v1/security/login",
         json={
             "username": superset_identity,
             "password": superset_secret,
@@ -3124,7 +3131,7 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
     # session management and concurrnt session check
     
     sesson_management_response = requests.post(
-        "http://localhost:80/users/login",
+        f"{config.BASE_URL}/users/login",
         json={
             "identity": magistrala_identity,
             "password": magistrala_secret
@@ -3332,6 +3339,61 @@ class ScheduleRequest(BaseModel):
     timezone: str = Field("UTC", description="IANA timezone name e.g. UTC, Asia/Kolkata, America/New_York")
 
 
+class BackupScheduleRequest(BaseModel):
+    time: str = Field(..., description="Daily backup time in HH:MM format (24-hour)")
+    timezone: str = Field("UTC", description="IANA timezone name e.g. UTC, Asia/Kolkata, America/New_York")
+    mode: Literal["incremental", "full", "limit", "hours", "range"] = Field(
+        "incremental",
+        description="incremental=watermark-based (default), full=reset+sync all, limit=last N records, hours=last N hours, range=date range",
+    )
+    limit: Optional[int] = Field(None, gt=0, description="Required for mode=limit")
+    hours: Optional[int] = Field(None, gt=0, description="Required for mode=hours")
+    start: Optional[str] = Field(None, description="Required for mode=range. ISO datetime e.g. 2026-06-01T00:00:00")
+    end: Optional[str] = Field(None, description="Required for mode=range. ISO datetime e.g. 2026-06-07T23:59:59")
+
+
+def _validate_backup_request(req: BackupScheduleRequest):
+    parts = req.time.split(":")
+    try:
+        if len(parts) != 2:
+            raise ValueError
+        h, m = int(parts[0]), int(parts[1])
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid time '{req.time}': use HH:MM (24-hour, e.g. 02:00)",
+        )
+    try:
+        import zoneinfo
+        zoneinfo.ZoneInfo(req.timezone)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown timezone '{req.timezone}'.",
+        )
+    if req.mode == "limit" and req.limit is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="limit is required for mode=limit")
+    if req.mode == "hours" and req.hours is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="hours is required for mode=hours")
+    if req.mode == "range":
+        if not req.start or not req.end:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start and end are required for mode=range")
+        try:
+            def _to_utc(s):
+                dt = datetime.fromisoformat(s)
+                return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            start_dt = _to_utc(req.start)
+            end_dt = _to_utc(req.end)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid datetime: {e}")
+        if start_dt >= end_dt:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start must be before end")
+        return start_dt, end_dt
+    return None, None
+
+
 class NasScheduleRequest(BaseModel):
     time: str = Field(..., description="Daily NAS backup time in HH:MM format (24-hour)")
     timezone: str = Field("UTC", description="IANA timezone name e.g. UTC, Asia/Kolkata, America/New_York")
@@ -3340,83 +3402,253 @@ class NasScheduleRequest(BaseModel):
     username: str = Field(..., description="SSH username")
     password: str = Field(..., description="SSH password — stored on server for scheduled runs")
     remote_path: str = Field(..., description="Base folder on NAS for exports")
+    mode: Literal["full", "limit", "hours", "range"] = Field(
+        "full", description="full=all records (default), limit=last N records, hours=last N hours, range=date range"
+    )
+    limit: Optional[int] = Field(None, gt=0, description="Required for mode=limit")
+    hours: Optional[int] = Field(None, gt=0, description="Required for mode=hours")
+    start: Optional[str] = Field(None, description="Required for mode=range. ISO datetime e.g. 2026-06-01T00:00:00")
+    end: Optional[str] = Field(None, description="Required for mode=range. ISO datetime e.g. 2026-06-07T23:59:59")
+
+
+def _validate_nas_request(req: NasScheduleRequest):
+    parts = req.time.split(":")
+    try:
+        if len(parts) != 2:
+            raise ValueError
+        h, m = int(parts[0]), int(parts[1])
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid time '{req.time}': use HH:MM (24-hour, e.g. 02:00)",
+        )
+    try:
+        import zoneinfo
+        zoneinfo.ZoneInfo(req.timezone)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown timezone '{req.timezone}'.",
+        )
+    if req.mode == "limit" and req.limit is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="limit is required for mode=limit")
+    if req.mode == "hours" and req.hours is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="hours is required for mode=hours")
+    if req.mode == "range":
+        if not req.start or not req.end:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start and end are required for mode=range")
+        try:
+            def _to_utc(s):
+                dt = datetime.fromisoformat(s)
+                return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            start_dt = _to_utc(req.start)
+            end_dt = _to_utc(req.end)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid datetime: {e}")
+        if start_dt >= end_dt:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start must be before end")
+        return start_dt, end_dt
+    return None, None
+
+
+class ImportScheduleRequest(BaseModel):
+    time: str = Field(..., description="Daily import time in HH:MM format (24-hour)")
+    timezone: str = Field("UTC", description="IANA timezone name e.g. UTC, Asia/Kolkata, America/New_York")
+    host: str = Field(..., description="NAS / SSH server hostname or IP")
+    port: int = Field(22, description="SSH port")
+    username: str = Field(..., description="SSH username")
+    password: str = Field(..., description="SSH password — stored encrypted for scheduled runs")
+    remote_path: str = Field(..., description="Base NAS folder containing export_* subfolders")
+    mode: Literal["full", "limit", "hours", "range"] = Field(
+        "full", description="full=all rows (default), limit=first N rows, hours=last N hours, range=date range"
+    )
+    limit: Optional[int] = Field(None, gt=0, description="Required for mode=limit")
+    hours: Optional[int] = Field(None, gt=0, description="Required for mode=hours")
+    start: Optional[str] = Field(None, description="Required for mode=range. ISO datetime e.g. 2026-06-01T00:00:00")
+    end: Optional[str] = Field(None, description="Required for mode=range. ISO datetime e.g. 2026-06-07T23:59:59")
+    folder: Optional[str] = Field(None, description="Specific export_* folder name to import from. Omit to auto-pick the latest.")
+
+
+def _validate_import_request(req: ImportScheduleRequest):
+    parts = req.time.split(":")
+    try:
+        if len(parts) != 2:
+            raise ValueError
+        h, m = int(parts[0]), int(parts[1])
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid time '{req.time}': use HH:MM (24-hour, e.g. 02:00)",
+        )
+    try:
+        import zoneinfo
+        zoneinfo.ZoneInfo(req.timezone)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown timezone '{req.timezone}'.",
+        )
+    if req.mode == "limit" and req.limit is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="limit is required for mode=limit")
+    if req.mode == "hours" and req.hours is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="hours is required for mode=hours")
+    if req.mode == "range":
+        if not req.start or not req.end:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start and end are required for mode=range")
+        try:
+            def _to_utc(s):
+                dt = datetime.fromisoformat(s)
+                return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            start_dt = _to_utc(req.start)
+            end_dt = _to_utc(req.end)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid datetime: {e}")
+        if start_dt >= end_dt:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start must be before end")
+        return start_dt, end_dt
+    return None, None
 
 
 # ── Health ──────────────────────────────────────────────
 
 @app.get("/downlink/guardian/health")
 def health_check(current_user=Depends(auth.get_current_user)):
-    """Check if the source Magistrala DB is reachable."""
+    """Check if the source (Magistrala) DB is reachable."""
     try:
         conn = get_source_conn()
         conn.close()
         return {"status": "UP", "message": "Magistrala DB is reachable"}
-
     except psycopg2.OperationalError as oe:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(oe),
-        )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(oe))
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal Server Error: {e}",
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal Server Error: {e}")
+
+
+@app.get("/downlink/guardian/backup-db/health")
+def backup_db_health(current_user=Depends(auth.get_current_user)):
+    """Check if the Backup DB (TimescaleDB) is reachable."""
+    try:
+        with managed_conn(get_target_conn) as (_conn, cur):
+            cur.execute("SELECT 1")
+        return {"status": "UP", "message": "Backup DB (TimescaleDB) is reachable"}
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
 
 
 # ── Internal Backup (source → target) ──────────────────
 
 @app.post("/downlink/guardian/backup")
 def backup(current_user=Depends(auth.get_current_user)):
-    """Run incremental sync from source to target DB."""
+    """Backup the latest 50,000 records from source to TimescaleDB (hard cap)."""
+    MAX_LIMIT = 50000
     start = datetime.now(timezone.utc)
     try:
-        output = _run_script([sys.executable, SYNC_SCRIPT])
-        duration = round((datetime.now(timezone.utc) - start).total_seconds(), 2)
-        source_count, backup_count = None, None
+        # Check backup_control.enabled
+        with managed_conn(get_target_conn) as (_conn, cur):
+            cur.execute("SELECT enabled FROM backup_control WHERE id = TRUE")
+            row = cur.fetchone()
+            if not row or row[0] is not True:
+                raise HTTPException(
+                    status_code=status.HTTP_423_LOCKED,
+                    detail="Backup is disabled. Enable it first via POST /downlink/guardian/backup/enable",
+                )
+
+        src_conn = get_source_conn()
+        tgt_conn = get_target_conn()
+        src_cur = src_conn.cursor()
+        tgt_cur = tgt_conn.cursor()
+
+        insert_sql = """
+            INSERT INTO messages (
+                time, channel, subtopic, publisher, protocol,
+                name, unit, value, string_value, bool_value,
+                data_value, sum, update_time
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (time, publisher, subtopic, name) DO UPDATE SET
+                channel      = EXCLUDED.channel,
+                protocol     = EXCLUDED.protocol,
+                unit         = EXCLUDED.unit,
+                value        = EXCLUDED.value,
+                string_value = EXCLUDED.string_value,
+                bool_value   = EXCLUDED.bool_value,
+                data_value   = EXCLUDED.data_value,
+                sum          = EXCLUDED.sum,
+                update_time  = EXCLUDED.update_time
+        """
+
         try:
-            with managed_conn(get_source_conn) as (_conn, cur):
-                cur.execute("SELECT COUNT(*) FROM messages")
-                source_count = cur.fetchone()[0]
-            with managed_conn(get_target_conn) as (_conn, cur):
-                cur.execute("SELECT COUNT(*) FROM messages")
-                backup_count = cur.fetchone()[0]
-        except Exception as e:
-            logging.warning(f"Failed to retrieve row counts: {e}")
+            src_cur.execute("""
+                SELECT * FROM (
+                    SELECT
+                        time, channel, subtopic, publisher, protocol,
+                        name, unit, value, string_value, bool_value,
+                        data_value, sum,
+                        COALESCE(NULLIF(update_time, 0), time) AS update_time_epoch
+                    FROM messages
+                    ORDER BY COALESCE(NULLIF(update_time, 0), time) DESC
+                    LIMIT %s
+                ) t ORDER BY update_time_epoch
+            """, (MAX_LIMIT,))
+
+            rows = src_cur.fetchall()
+            total_fetched = len(rows)
+
+            processed = []
+            for r in rows:
+                row = list(r)
+                epoch_val = row[-1]
+                ts_val = (
+                    datetime.fromtimestamp(epoch_val, timezone.utc)
+                    if epoch_val is not None
+                    else datetime.now(timezone.utc)
+                )
+                processed.append(tuple(list(row[:-1]) + [ts_val]))
+
+            BATCH_SIZE = 10000
+            total_upserted = 0
+            for i in range(0, len(processed), BATCH_SIZE):
+                batch = processed[i:i + BATCH_SIZE]
+                execute_batch(tgt_cur, insert_sql, batch)
+                tgt_conn.commit()
+                total_upserted += len(batch)
+
+        finally:
+            src_cur.close()
+            tgt_cur.close()
+            src_conn.close()
+            tgt_conn.close()
+
+        duration = round((datetime.now(timezone.utc) - start).total_seconds(), 2)
         _append_history(BACKUP_HISTORY_FILE, {
             "start_time": start.isoformat(),
             "status": "SUCCESS",
+            "mode": "limit",
             "duration_seconds": duration,
-            "source_count": source_count,
-            "backup_count": backup_count,
+            "rows_fetched": total_fetched,
+            "rows_upserted": total_upserted,
         })
-        return {"status": "SUCCESS", "output": output}
+        return {
+            "status": "SUCCESS",
+            "rows_fetched": total_fetched,
+            "rows_upserted": total_upserted,
+            "limit": MAX_LIMIT,
+            "duration_seconds": duration,
+        }
 
-    except subprocess.TimeoutExpired:
-        _append_history(BACKUP_HISTORY_FILE, {
-            "start_time": start.isoformat(),
-            "status": "FAILED",
-            "duration_seconds": round((datetime.now(timezone.utc) - start).total_seconds(), 2),
-            "source_count": None,
-            "backup_count": None,
-        })
-        raise HTTPException(
-            status_code=status.HTTP_408_REQUEST_TIMEOUT,
-            detail="Sync process timed out",
-        )
-    except PermissionError as pe:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(pe),
-        )
+    except HTTPException:
+        raise
     except Exception as e:
         logging.warning(f"Unexpected error occurred: {e}")
         _append_history(BACKUP_HISTORY_FILE, {
             "start_time": start.isoformat(),
             "status": "FAILED",
             "duration_seconds": round((datetime.now(timezone.utc) - start).total_seconds(), 2),
-            "source_count": None,
-            "backup_count": None,
+            "rows_fetched": None,
+            "rows_upserted": None,
         })
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3424,160 +3656,183 @@ def backup(current_user=Depends(auth.get_current_user)):
         )
 
 
-# ── Internal Restore (target → source) ─────────────────
+# ── Restore Schedule (merged: full | limit | hours | range) ────────────────
 
-@app.post("/downlink/guardian/restore")
-def restore(
-    limit: int | None = Query(
-        default=None,
-        gt=0,
-        description="Restore latest N records. If omitted, full restore."
-    ),
-    current_user=Depends(auth.get_current_user)
-):
-    """Restore from target DB back to source. Optionally limit to N records."""
+class RestoreScheduleRequest(BaseModel):
+    time: str = Field(..., description="Daily restore time in HH:MM format (24-hour)")
+    timezone: str = Field("UTC", description="IANA timezone name e.g. UTC, Asia/Kolkata")
+    mode: Literal["full", "limit", "hours", "range"] = Field(
+        ..., description="full=all records, limit=last N records, hours=last N hours, range=date range"
+    )
+    limit: Optional[int] = Field(None, gt=0, description="Required for mode=limit")
+    hours: Optional[int] = Field(None, gt=0, description="Required for mode=hours")
+    start: Optional[str] = Field(None, description="Required for mode=range. ISO datetime e.g. 2026-06-01T00:00:00")
+    end: Optional[str] = Field(None, description="Required for mode=range. ISO datetime e.g. 2026-06-07T23:59:59")
+
+
+def _validate_restore_request(req: RestoreScheduleRequest):
+    parts = req.time.split(":")
     try:
-        command = [sys.executable, REVERSE_SYNC_SCRIPT]
-        if limit is not None:
-            command.extend(["--limit", str(limit)])
-
-        output = _run_script(command)
-
-        return {
-            "status": "SUCCESS",
-            "mode": "FULL_RESTORE" if limit is None else f"LAST_{limit}_RECORDS",
-            "output": output,
-        }
-
-    except subprocess.TimeoutExpired:
+        if len(parts) != 2:
+            raise ValueError
+        h, m = int(parts[0]), int(parts[1])
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_408_REQUEST_TIMEOUT,
-            detail="Restore process timed out",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid time '{req.time}': use HH:MM (24-hour, e.g. 02:00)",
         )
-    except PermissionError as pe:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(pe),
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal Server Error: {e}",
-        )
-
-
-@app.post("/downlink/guardian/restore/time")
-def restore_by_time(
-    hours: int = Query(..., gt=0, description="Number of hours to restore"),
-    current_user=Depends(auth.get_current_user)
-):
-    """Restore the last N hours of data from target → source."""
     try:
-        output = _run_script([sys.executable, REVERSE_SYNC_SCRIPT, str(hours)])
-
-        return {
-            "status": "SUCCESS",
-            "hours": hours,
-            "message": f"Restore completed for last {hours} hours",
-            "output": output,
-        }
-
-    except subprocess.TimeoutExpired:
+        import zoneinfo
+        zoneinfo.ZoneInfo(req.timezone)
+    except Exception:
         raise HTTPException(
-            status_code=status.HTTP_408_REQUEST_TIMEOUT,
-            detail="Restore process timed out",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown timezone '{req.timezone}'.",
         )
-    except PermissionError as pe:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(pe),
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal Server Error: {e}",
-        )
-
-
-@app.post("/downlink/guardian/restore/range")
-def restore_by_range(req: DateRangeRequest, current_user=Depends(auth.get_current_user)):
-    """Restore rows in a date range from Backup DB → Production DB."""
-    try:
+    if req.mode == "limit" and req.limit is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="limit is required for mode=limit")
+    if req.mode == "hours" and req.hours is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="hours is required for mode=hours")
+    if req.mode == "range":
+        if not req.start or not req.end:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start and end are required for mode=range")
         try:
-            def _to_utc(s: str) -> datetime:
+            def _to_utc(s):
                 dt = datetime.fromisoformat(s)
                 return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
             start_dt = _to_utc(req.start)
             end_dt = _to_utc(req.end)
         except ValueError as e:
-            raise ValueError(f"Invalid datetime: {e}. Use ISO format e.g. 2026-06-06T00:00:00")
-
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid datetime: {e}")
         if start_dt >= end_dt:
-            raise ValueError("start must be before end")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start must be before end")
+        return start_dt, end_dt
+    return None, None
 
-        src_conn = get_source_conn()
-        tgt_conn = get_target_conn()
-        src_cur = src_conn.cursor()
-        tgt_cur = tgt_conn.cursor(name="range_restore_cursor")
 
-        try:
-            tgt_cur.execute("""
-                SELECT time, channel, subtopic, publisher, protocol,
-                       name, unit, value, string_value, bool_value,
-                       data_value, sum, update_time
-                FROM messages
-                WHERE update_time >= %s AND update_time <= %s
-                ORDER BY update_time
-            """, (start_dt, end_dt))
+@app.post("/downlink/guardian/restore/schedule")
+def set_restore_schedule(req: RestoreScheduleRequest, current_user=Depends(auth.get_current_user)):
+    """Schedule a daily restore. Returns 409 if a schedule already exists — DELETE it first."""
+    if not _SCHEDULER_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="APScheduler not installed. Run: pip install apscheduler",
+        )
 
-            insert_sql = """
-                INSERT INTO messages (
-                    time, channel, subtopic, publisher, protocol,
-                    name, unit, value, string_value, bool_value,
-                    data_value, sum, update_time
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (time, publisher, subtopic, name) DO NOTHING
-            """
+    existing = _scheduler.get_job("daily_restore")
+    if existing:
+        saved = {}
+        if os.path.exists(RESTORE_SCHEDULE_FILE):
+            try:
+                with open(RESTORE_SCHEDULE_FILE) as f:
+                    saved = json.load(f)
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "A restore schedule already exists. DELETE /downlink/guardian/restore/schedule first.",
+                "current_schedule": {k: v for k, v in saved.items() if k != "user_id"},
+                "next_run": existing.next_run_time.isoformat() if existing.next_run_time else None,
+            },
+        )
 
-            total_fetched = 0
-            total_inserted = 0
+    start_dt, end_dt = _validate_restore_request(req)
+    try:
+        kwargs = {}
+        saved = {"time": req.time, "timezone": req.timezone, "mode": req.mode, "user_id": current_user.id}
 
-            while True:
-                rows = tgt_cur.fetchmany(10000)
-                if not rows:
-                    break
-                total_fetched += len(rows)
-                batch = []
-                for r in rows:
-                    row = list(r)
-                    # update_time is TIMESTAMP in backup DB — convert to epoch for production
-                    row[-1] = row[-1].timestamp() if row[-1] is not None else None
-                    batch.append(tuple(row))
-                execute_batch(src_cur, insert_sql, batch)
-                src_conn.commit()
-                total_inserted += len(batch)
+        if req.mode == "limit":
+            kwargs["limit"] = req.limit
+            saved["limit"] = req.limit
+        elif req.mode == "hours":
+            kwargs["hours"] = req.hours
+            saved["hours"] = req.hours
+        elif req.mode == "range":
+            kwargs["start_dt"] = start_dt
+            kwargs["end_dt"] = end_dt
+            saved["start_dt"] = start_dt.isoformat()
+            saved["end_dt"] = end_dt.isoformat()
 
-        finally:
-            tgt_cur.close()
-            src_cur.close()
-            tgt_conn.close()
-            src_conn.close()
+        _apply_restore_schedule(req.time, req.timezone, req.mode, **kwargs)
+        with open(RESTORE_SCHEDULE_FILE, "w") as f:
+            json.dump(saved, f, indent=2)
+
+        job = _scheduler.get_job("daily_restore")
+        next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
 
         return {
-            "status": "SUCCESS",
-            "start": start_dt.isoformat(),
-            "end": end_dt.isoformat(),
-            "rows_found": total_fetched,
-            "rows_inserted": total_inserted,
+            "status": "Scheduled",
+            "time": req.time,
+            "timezone": req.timezone,
+            "mode": req.mode,
+            "next_run": next_run,
+            "note": "Restore runs daily at the specified time. Persisted — survives API restarts.",
         }
-
-    except ValueError as ve:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@app.get("/downlink/guardian/restore/schedule")
+def get_restore_schedule(current_user=Depends(auth.get_current_user)):
+    """Return the current restore schedule, or indicate none is set."""
+    if not _SCHEDULER_AVAILABLE:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal Server Error: {e}",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="APScheduler not installed. Run: pip install apscheduler",
         )
+    job = _scheduler.get_job("daily_restore")
+    if not job:
+        return {"scheduled": False, "schedule": None, "next_run": None}
+
+    schedule_data = None
+    if os.path.exists(RESTORE_SCHEDULE_FILE):
+        try:
+            with open(RESTORE_SCHEDULE_FILE) as f:
+                schedule_data = json.load(f)
+        except Exception:
+            pass
+
+    return {
+        "scheduled": True,
+        "schedule": schedule_data,
+        "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+    }
+
+
+@app.delete("/downlink/guardian/restore/schedule")
+def delete_restore_schedule(current_user=Depends(auth.get_current_user)):
+    """Remove the scheduled restore."""
+    if not _SCHEDULER_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="APScheduler not installed. Run: pip install apscheduler",
+        )
+    job = _scheduler.get_job("daily_restore")
+    if job:
+        _scheduler.remove_job("daily_restore")
+    if os.path.exists(RESTORE_SCHEDULE_FILE):
+        try:
+            os.remove(RESTORE_SCHEDULE_FILE)
+        except OSError as e:
+            logging.warning(f"Could not remove restore schedule file: {e}")
+    return {"status": "Restore schedule removed"}
+
+
+@app.get("/downlink/guardian/restore/history")
+def restore_history(limit: int = Query(default=20, ge=1, le=1000), current_user=Depends(auth.get_current_user)):
+    """Return last N restore run records (newest first). Default 20, max 1000."""
+    if not os.path.exists(RESTORE_HISTORY_FILE):
+        return {"total": 0, "history": []}
+    try:
+        with open(RESTORE_HISTORY_FILE) as f:
+            history = json.load(f)
+        records = list(reversed(history))[:limit]
+        return {"total": len(records), "history": records}
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 # ── Backup control ─────────────────────────────────────
@@ -3623,19 +3878,11 @@ def enable_backup(current_user=Depends(auth.get_current_user)):
                 WHERE id = TRUE
             """)
             conn.commit()
-
         return {"status": "Backup enabled"}
-
     except psycopg2.Error as pe:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(pe),
-        )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(pe))
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal Server Error: {e}",
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal Server Error: {e}")
 
 
 @app.post("/downlink/guardian/backup/disable")
@@ -3649,19 +3896,11 @@ def disable_backup(current_user=Depends(auth.get_current_user)):
                 WHERE id = TRUE
             """)
             conn.commit()
-
         return {"status": "Backup disabled"}
-
     except psycopg2.Error as pe:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(pe),
-        )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(pe))
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal Server Error: {e}",
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal Server Error: {e}")
 
 
 # ── Watermark reset ────────────────────────────────────
@@ -3715,40 +3954,54 @@ def reset_watermark(
 # ── Scheduled backup ───────────────────────────────────
 
 @app.post("/downlink/guardian/backup/schedule")
-def set_backup_schedule(req: ScheduleRequest, current_user=Depends(auth.get_current_user)):
-    """Schedule a daily automatic backup at the specified time. Survives API restarts."""
+def set_backup_schedule(req: BackupScheduleRequest, current_user=Depends(auth.get_current_user)):
+    """Schedule a daily automatic backup. Returns 409 if a schedule already exists — DELETE it first.
+    mode: incremental (default) | full | limit | hours | range
+    """
     if not _SCHEDULER_AVAILABLE:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="APScheduler not installed. Run: pip install apscheduler",
         )
 
-    parts = req.time.split(":")
-    try:
-        if len(parts) != 2:
-            raise ValueError
-        h, m = int(parts[0]), int(parts[1])
-        if not (0 <= h <= 23 and 0 <= m <= 59):
-            raise ValueError
-    except ValueError:
+    existing = _scheduler.get_job("daily_backup")
+    if existing:
+        saved = {}
+        if os.path.exists(SCHEDULE_FILE):
+            try:
+                with open(SCHEDULE_FILE) as f:
+                    saved = json.load(f)
+            except Exception:
+                pass
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid time '{req.time}': use HH:MM (24-hour, e.g. 23:30)",
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "A backup schedule already exists. DELETE /downlink/guardian/backup/schedule first.",
+                "current_schedule": {k: v for k, v in saved.items() if k != "user_id"},
+                "next_run": existing.next_run_time.isoformat() if existing.next_run_time else None,
+            },
         )
 
+    start_dt, end_dt = _validate_backup_request(req)
     try:
-        import zoneinfo
-        zoneinfo.ZoneInfo(req.timezone)
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unknown timezone '{req.timezone}'. Use IANA name e.g. UTC, Asia/Kolkata, America/New_York",
-        )
+        kwargs = {}
+        persist = {"time": req.time, "timezone": req.timezone, "mode": req.mode, "user_id": current_user.id}
 
-    try:
-        _apply_schedule(req.time, req.timezone)
+        if req.mode == "limit":
+            kwargs["limit"] = req.limit
+            persist["limit"] = req.limit
+        elif req.mode == "hours":
+            kwargs["hours"] = req.hours
+            persist["hours"] = req.hours
+        elif req.mode == "range":
+            kwargs["start_dt"] = start_dt
+            kwargs["end_dt"] = end_dt
+            persist["start_dt"] = start_dt.isoformat()
+            persist["end_dt"] = end_dt.isoformat()
+
+        _apply_schedule(req.time, req.timezone, req.mode, **kwargs)
         with open(SCHEDULE_FILE, "w") as f:
-            json.dump({"time": req.time, "timezone": req.timezone, "user_id": current_user.id}, f, indent=2)
+            json.dump(persist, f, indent=2)
 
         job = _scheduler.get_job("daily_backup")
         next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
@@ -3757,6 +4010,7 @@ def set_backup_schedule(req: ScheduleRequest, current_user=Depends(auth.get_curr
             "status": "Scheduled",
             "time": req.time,
             "timezone": req.timezone,
+            "mode": req.mode,
             "next_run": next_run,
             "note": "Backup runs daily at the specified time. Persisted — survives API restarts.",
         }
@@ -3816,35 +4070,35 @@ def delete_backup_schedule(current_user=Depends(auth.get_current_user)):
 
 @app.post("/downlink/guardian/nas-backup/schedule")
 def set_nas_schedule(req: NasScheduleRequest, current_user=Depends(auth.get_current_user)):
-    """Schedule a daily automatic NAS export at the specified time."""
+    """Schedule a daily automatic NAS export. Returns 409 if a schedule already exists — DELETE it first.
+    mode: full (default) | limit | hours | range
+    """
     if not _SCHEDULER_AVAILABLE:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="APScheduler not installed. Run: pip install apscheduler",
         )
 
-    parts = req.time.split(":")
-    try:
-        if len(parts) != 2:
-            raise ValueError
-        h, m = int(parts[0]), int(parts[1])
-        if not (0 <= h <= 23 and 0 <= m <= 59):
-            raise ValueError
-    except ValueError:
+    existing = _scheduler.get_job("daily_nas_backup")
+    if existing:
+        saved = {}
+        if os.path.exists(NAS_SCHEDULE_FILE):
+            try:
+                with open(NAS_SCHEDULE_FILE) as f:
+                    saved = json.load(f)
+            except Exception:
+                pass
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid time '{req.time}': use HH:MM (24-hour, e.g. 23:30)",
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "A NAS backup schedule already exists. DELETE /downlink/guardian/nas-backup/schedule first.",
+                "current_schedule": {k: v for k, v in saved.items() if k not in ("password", "user_id")},
+                "next_run": existing.next_run_time.isoformat() if existing.next_run_time else None,
+            },
         )
 
-    try:
-        import zoneinfo
-        zoneinfo.ZoneInfo(req.timezone)
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unknown timezone '{req.timezone}'. Use IANA name e.g. UTC, Asia/Kolkata, America/New_York",
-        )
-        
+    start_dt, end_dt = _validate_nas_request(req)
+
     try:
         ssh, sftp = sftp_connect(req.host, req.port, req.username, req.password)
         sftp.close()
@@ -3854,24 +4108,37 @@ def set_nas_schedule(req: NasScheduleRequest, current_user=Depends(auth.get_curr
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"SSH connection test failed: {e}",
         )
-        
+
     try:
+        kwargs = {}
+        enc_password = base64.b64encode(encrypt(req.password.encode(), load_key())).decode()
+        persist = {
+            "time": req.time, "timezone": req.timezone,
+            "host": req.host, "port": req.port,
+            "username": req.username, "password": enc_password,
+            "remote_path": req.remote_path,
+            "mode": req.mode, "user_id": current_user.id,
+        }
+
+        if req.mode == "limit":
+            kwargs["limit"] = req.limit
+            persist["limit"] = req.limit
+        elif req.mode == "hours":
+            kwargs["hours"] = req.hours
+            persist["hours"] = req.hours
+        elif req.mode == "range":
+            kwargs["start_dt"] = start_dt
+            kwargs["end_dt"] = end_dt
+            persist["start_dt"] = start_dt.isoformat()
+            persist["end_dt"] = end_dt.isoformat()
+
         _apply_nas_schedule(
             req.time, req.timezone,
             req.host, req.port, req.username, req.password, req.remote_path,
+            req.mode, **kwargs,
         )
-        enc_password = base64.b64encode(encrypt(req.password.encode(), load_key())).decode()
         with open(NAS_SCHEDULE_FILE, "w") as f:
-            json.dump({
-                "time": req.time,
-                "timezone": req.timezone,
-                "host": req.host,
-                "port": req.port,
-                "username": req.username,
-                "password": enc_password,
-                "remote_path": req.remote_path,
-                "user_id": current_user.id,
-            }, f, indent=2)
+            json.dump(persist, f, indent=2)
 
         job = _scheduler.get_job("daily_nas_backup")
         next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
@@ -3880,6 +4147,7 @@ def set_nas_schedule(req: NasScheduleRequest, current_user=Depends(auth.get_curr
             "status": "Scheduled",
             "time": req.time,
             "timezone": req.timezone,
+            "mode": req.mode,
             "target": f"{req.username}@{req.host}:{req.port}{req.remote_path}",
             "next_run": next_run,
             "note": "NAS export runs daily at the specified time. Persisted — survives API restarts.",
@@ -3942,15 +4210,20 @@ def delete_nas_schedule(current_user=Depends(auth.get_current_user)):
 
 @app.get("/downlink/guardian/backup/sync-status")
 def sync_status(current_user=Depends(auth.get_current_user)):
-    """Compare Production DB vs Backup DB row counts and show sync state."""
+    """Compare Production DB vs Backup DB row counts, sync state, and last sync time."""
     try:
         with managed_conn(get_source_conn) as (_conn, cur):
             cur.execute("SELECT COUNT(*) FROM messages")
             production_count = cur.fetchone()[0]
 
+        last_synced_time = None
         with managed_conn(get_target_conn) as (_conn, cur):
             cur.execute("SELECT COUNT(*) FROM messages")
             backup_count = cur.fetchone()[0]
+            cur.execute("SELECT last_synced_time FROM backup_metadata WHERE id = TRUE")
+            row = cur.fetchone()
+            if row and row[0]:
+                last_synced_time = row[0].isoformat()
 
         difference = production_count - backup_count
         in_sync = difference == 0
@@ -3967,12 +4240,12 @@ def sync_status(current_user=Depends(auth.get_current_user)):
             message = (
                 f"Backup is out of sync by {difference:,} rows. "
                 f"Next auto-backup scheduled at {next_run}. "
-                f"To sync now: POST /downlink/backup."
+                f"To sync now: POST /downlink/guardian/backup."
             )
         else:
             message = (
                 f"Backup is out of sync by {difference:,} rows. "
-                f"No schedule set — sync manually via POST /downlink/backup."
+                f"No schedule set — sync manually via POST /downlink/guardian/backup."
             )
 
         return {
@@ -3980,6 +4253,7 @@ def sync_status(current_user=Depends(auth.get_current_user)):
             "backup_count": backup_count,
             "difference": difference,
             "in_sync": in_sync,
+            "last_synced_time": last_synced_time,
             "next_scheduled_backup": next_run,
             "message": message,
         }
@@ -3995,19 +4269,6 @@ def sync_status(current_user=Depends(auth.get_current_user)):
             detail=f"Internal Server Error: {e}",
         )
 
-
-@app.get("/downlink/guardian/backup-db/health")
-def backup_db_health(current_user=Depends(auth.get_current_user)):
-    """Check if the Backup DB (TimescaleDB) is reachable."""
-    try:
-        with managed_conn(get_target_conn) as (_conn, cur):
-            cur.execute("SELECT 1")
-        return {"status": "UP", "message": "Backup DB (TimescaleDB) is reachable"}
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(e),
-        )
 
 
 @app.get("/downlink/guardian/backup/history")
@@ -4046,34 +4307,6 @@ def get_nas_configs(current_user=Depends(auth.get_current_user)):
     return {"total": len(configs), "servers": configs}
 
 
-@app.get("/downlink/guardian/backup/last")
-def last_sync_info(current_user=Depends(auth.get_current_user)):
-    """Return the last sync watermark timestamp."""
-    try:
-        with managed_conn(get_target_conn) as (_conn, cur):
-            cur.execute("SELECT last_synced_time FROM backup_metadata WHERE id = TRUE")
-            row = cur.fetchone()
-
-            if not row:
-                raise ValueError("backup_metadata row not found")
-
-            return {"last_synced_time": row[0].isoformat() if row[0] else None}
-
-    except ValueError as ve:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(ve),
-        )
-    except psycopg2.Error as pe:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(pe),
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal Server Error: {e}",
-        )
 
 
 # ── Secure export (Production DB → AES-256-GCM → SHA256 → SFTP → External Server) ──
@@ -4093,6 +4326,7 @@ def api_secure_export(remote: RemoteConfig, current_user=Depends(auth.get_curren
             username=remote.username,
             password=remote.password,
             remote_path=remote.remote_path,
+            limit=200000,
         )
         _save_nas_config(remote.host, remote.port, remote.username, remote.remote_path)
         _append_history(NAS_HISTORY_FILE, {
@@ -4123,8 +4357,8 @@ def api_secure_export(remote: RemoteConfig, current_user=Depends(auth.get_curren
 @app.post("/downlink/guardian/secure-import/backup-db")
 def api_secure_import_backup(remote: RemoteConfig, current_user=Depends(auth.get_current_user)):
     """
-    Download encrypted batches from external server, verify SHA256 integrity,
-    decrypt with AES-256-GCM, and insert into TimescaleDB (backup DB).
+    Download encrypted batches from NAS, verify SHA256, decrypt, and insert into
+    TimescaleDB (backup DB). Hard cap: 50,000 rows. Use the schedule endpoint for full imports.
     """
     try:
         return secure_import(
@@ -4134,6 +4368,7 @@ def api_secure_import_backup(remote: RemoteConfig, current_user=Depends(auth.get
             password=remote.password,
             remote_path=remote.remote_path,
             target="backup",
+            limit=50000,
         )
     except ValueError as ve:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
@@ -4146,8 +4381,8 @@ def api_secure_import_backup(remote: RemoteConfig, current_user=Depends(auth.get
 @app.post("/downlink/guardian/secure-import/production-db")
 def api_secure_import_production(remote: RemoteConfig, current_user=Depends(auth.get_current_user)):
     """
-    Download encrypted batches from external server, verify SHA256 integrity,
-    decrypt with AES-256-GCM, and insert into Production DB (magistrala).
+    Download encrypted batches from NAS, verify SHA256, decrypt, and insert into
+    Production DB (magistrala). Hard cap: 50,000 rows. Use the schedule endpoint for full imports.
     """
     try:
         return secure_import(
@@ -4157,11 +4392,199 @@ def api_secure_import_production(remote: RemoteConfig, current_user=Depends(auth
             password=remote.password,
             remote_path=remote.remote_path,
             target="production",
+            limit=50000,
         )
     except ValueError as ve:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ── Secure import schedule — backup-db ─────────────────────────────────────────
+
+def _import_schedule_post(req: ImportScheduleRequest, target: str,
+                          schedule_file: str, job_id: str,
+                          current_user) -> dict:
+    """Shared logic for both import schedule POST endpoints."""
+    if not _SCHEDULER_AVAILABLE:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="APScheduler not installed. Run: pip install apscheduler")
+
+    existing = _scheduler.get_job(job_id)
+    if existing:
+        saved = {}
+        if os.path.exists(schedule_file):
+            try:
+                with open(schedule_file) as f:
+                    saved = json.load(f)
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": f"An import schedule for {target} already exists. "
+                           f"DELETE /downlink/guardian/secure-import/{target}/schedule first.",
+                "current_schedule": {k: v for k, v in saved.items() if k not in ("password", "user_id")},
+                "next_run": existing.next_run_time.isoformat() if existing.next_run_time else None,
+            },
+        )
+
+    start_dt, end_dt = _validate_import_request(req)
+
+    try:
+        ssh, sftp = sftp_connect(req.host, req.port, req.username, req.password)
+        sftp.close()
+        ssh.close()
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"SSH connection test failed: {e}")
+
+    try:
+        kwargs = {}
+        enc_password = base64.b64encode(encrypt(req.password.encode(), load_key())).decode()
+        persist = {
+            "time": req.time, "timezone": req.timezone,
+            "host": req.host, "port": req.port,
+            "username": req.username, "password": enc_password,
+            "remote_base_path": req.remote_path,
+            "mode": req.mode, "user_id": current_user.id,
+        }
+        if req.folder:
+            persist["folder"] = req.folder
+
+        if req.mode == "limit":
+            kwargs["limit"] = req.limit
+            persist["limit"] = req.limit
+        elif req.mode == "hours":
+            kwargs["hours"] = req.hours
+            persist["hours"] = req.hours
+        elif req.mode == "range":
+            kwargs["start_dt"] = start_dt
+            kwargs["end_dt"] = end_dt
+            persist["start_dt"] = start_dt.isoformat()
+            persist["end_dt"] = end_dt.isoformat()
+
+        _apply_import_schedule(
+            req.time, req.timezone, target,
+            req.host, req.port, req.username, req.password,
+            req.remote_path, req.mode, folder=req.folder, **kwargs,
+        )
+        with open(schedule_file, "w") as f:
+            json.dump(persist, f, indent=2)
+
+        job = _scheduler.get_job(job_id)
+        next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+
+        return {
+            "status": "Scheduled",
+            "target": target,
+            "time": req.time,
+            "timezone": req.timezone,
+            "mode": req.mode,
+            "nas": f"{req.username}@{req.host}:{req.port}{req.remote_path}",
+            "next_run": next_run,
+            "note": "Imports from the latest export_* folder on NAS daily. Persisted — survives API restarts.",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@app.post("/downlink/guardian/secure-import/backup-db/schedule")
+def set_import_backup_schedule(req: ImportScheduleRequest, current_user=Depends(auth.get_current_user)):
+    """Schedule daily NAS → TimescaleDB import. 409 if schedule already exists — DELETE it first.
+    mode: full (default) | limit | hours | range. Picks the latest export_* folder automatically.
+    """
+    return _import_schedule_post(req, "backup",
+                                 IMPORT_BACKUP_SCHEDULE_FILE, "daily_import_backup", current_user)
+
+
+@app.get("/downlink/guardian/secure-import/backup-db/schedule")
+def get_import_backup_schedule(current_user=Depends(auth.get_current_user)):
+    """Return the current NAS → backup-db import schedule, or indicate none is set."""
+    if not _SCHEDULER_AVAILABLE:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="APScheduler not installed.")
+    job = _scheduler.get_job("daily_import_backup")
+    schedule_data = None
+    if os.path.exists(IMPORT_BACKUP_SCHEDULE_FILE):
+        try:
+            with open(IMPORT_BACKUP_SCHEDULE_FILE) as f:
+                saved = json.load(f)
+            schedule_data = {k: v for k, v in saved.items() if k not in ("password", "user_id")}
+        except Exception:
+            pass
+    return {
+        "scheduled": bool(job),
+        "schedule": schedule_data,
+        "next_run": job.next_run_time.isoformat() if job and job.next_run_time else None,
+    }
+
+
+@app.delete("/downlink/guardian/secure-import/backup-db/schedule")
+def delete_import_backup_schedule(current_user=Depends(auth.get_current_user)):
+    """Remove the scheduled NAS → backup-db import."""
+    if not _SCHEDULER_AVAILABLE:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="APScheduler not installed.")
+    job = _scheduler.get_job("daily_import_backup")
+    if job:
+        _scheduler.remove_job("daily_import_backup")
+    if os.path.exists(IMPORT_BACKUP_SCHEDULE_FILE):
+        try:
+            os.remove(IMPORT_BACKUP_SCHEDULE_FILE)
+        except OSError as e:
+            logging.warning(f"Could not remove import backup schedule file: {e}")
+    return {"status": "Import backup schedule removed"}
+
+
+# ── Secure import schedule — production-db ──────────────────────────────────────
+
+@app.post("/downlink/guardian/secure-import/production-db/schedule")
+def set_import_production_schedule(req: ImportScheduleRequest, current_user=Depends(auth.get_current_user)):
+    """Schedule daily NAS → Production DB import. 409 if schedule already exists — DELETE it first.
+    mode: full (default) | limit | hours | range. Picks the latest export_* folder automatically.
+    """
+    return _import_schedule_post(req, "production",
+                                 IMPORT_PRODUCTION_SCHEDULE_FILE, "daily_import_production", current_user)
+
+
+@app.get("/downlink/guardian/secure-import/production-db/schedule")
+def get_import_production_schedule(current_user=Depends(auth.get_current_user)):
+    """Return the current NAS → production-db import schedule, or indicate none is set."""
+    if not _SCHEDULER_AVAILABLE:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="APScheduler not installed.")
+    job = _scheduler.get_job("daily_import_production")
+    schedule_data = None
+    if os.path.exists(IMPORT_PRODUCTION_SCHEDULE_FILE):
+        try:
+            with open(IMPORT_PRODUCTION_SCHEDULE_FILE) as f:
+                saved = json.load(f)
+            schedule_data = {k: v for k, v in saved.items() if k not in ("password", "user_id")}
+        except Exception:
+            pass
+    return {
+        "scheduled": bool(job),
+        "schedule": schedule_data,
+        "next_run": job.next_run_time.isoformat() if job and job.next_run_time else None,
+    }
+
+
+@app.delete("/downlink/guardian/secure-import/production-db/schedule")
+def delete_import_production_schedule(current_user=Depends(auth.get_current_user)):
+    """Remove the scheduled NAS → production-db import."""
+    if not _SCHEDULER_AVAILABLE:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="APScheduler not installed.")
+    job = _scheduler.get_job("daily_import_production")
+    if job:
+        _scheduler.remove_job("daily_import_production")
+    if os.path.exists(IMPORT_PRODUCTION_SCHEDULE_FILE):
+        try:
+            os.remove(IMPORT_PRODUCTION_SCHEDULE_FILE)
+        except OSError as e:
+            logging.warning(f"Could not remove import production schedule file: {e}")
+    return {"status": "Import production schedule removed"}
 
 
 # ── List all exports on NAS ─────────────────────────────────────────────────

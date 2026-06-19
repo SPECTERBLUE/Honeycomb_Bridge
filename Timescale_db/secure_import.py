@@ -36,16 +36,15 @@ COLUMNS = [
     "data_value", "sum", "update_time",
 ]
 
-# TimescaleDB unique constraint: (time, channel, name)
+# TimescaleDB unique constraint: (time, publisher, subtopic, name)
 _INSERT_BACKUP = """
     INSERT INTO messages (
         time, channel, subtopic, publisher, protocol,
         name, unit, value, string_value, bool_value,
         data_value, sum, update_time
     ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    ON CONFLICT (time, channel, name) DO UPDATE SET
-        subtopic     = EXCLUDED.subtopic,
-        publisher    = EXCLUDED.publisher,
+    ON CONFLICT (time, publisher, subtopic, name) DO UPDATE SET
+        channel      = EXCLUDED.channel,
         protocol     = EXCLUDED.protocol,
         unit         = EXCLUDED.unit,
         value        = EXCLUDED.value,
@@ -96,6 +95,31 @@ def _parse_for_target(row: dict) -> tuple:
     return tuple(base)
 
 
+def find_latest_export(sftp, remote_base_path: str) -> str:
+    """Return the full path of the most recent export_* subfolder under remote_base_path."""
+    entries = sftp.listdir_attr(remote_base_path)
+    folders = sorted(
+        [e.filename for e in entries if e.filename.startswith("export_")],
+        reverse=True,
+    )
+    if not folders:
+        raise FileNotFoundError(f"No export_* folders found under {remote_base_path}")
+    return f"{remote_base_path.rstrip('/')}/{folders[0]}"
+
+
+def _get_row_epoch(row_tuple) -> int:
+    """Extract update_time as epoch int from a parsed row tuple (index 12)."""
+    val = row_tuple[12]
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return int(val.timestamp())
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
 def _decrypt_and_parse(encrypted: bytes, key: bytes, row_parser) -> list:
     plaintext = gzip.decompress(decrypt(encrypted, key))
     reader = csv.DictReader(io.StringIO(plaintext.decode("utf-8")))
@@ -109,19 +133,32 @@ def secure_import(
     password: str,
     remote_path: str,
     target: str = "backup",
+    limit: int = None,
+    hours: int = None,
+    start_dt=None,
+    end_dt=None,
 ) -> dict:
     """
     Download encrypted batch files from remote_path via SFTP, verify each batch's
     SHA256 checksum, decrypt with AES-256-GCM, and insert into the target DB.
 
-    target: "backup"     → TimescaleDB (backup DB)
-            "production" → Magistrala (production DB)
+    target   : "backup"     → TimescaleDB (backup DB)
+               "production" → Magistrala (production DB)
+    limit    : hard cap on total rows inserted
+    hours    : only import rows with update_time in the last N hours
+    start_dt / end_dt : only import rows with update_time in this UTC range
     """
     if target not in ("backup", "production"):
         raise ValueError("target must be 'backup' or 'production'")
 
     key = load_key()
     started = datetime.now(timezone.utc)
+
+    # Precompute time filter bounds (epoch seconds)
+    hours_cutoff = int(started.timestamp()) - hours * 3600 if hours is not None else None
+    start_epoch = int(start_dt.timestamp()) if start_dt is not None else None
+    end_epoch = int(end_dt.timestamp()) if end_dt is not None else None
+    use_time_filter = hours_cutoff is not None or start_epoch is not None
 
     conn = get_target_conn() if target == "backup" else get_source_conn()
     row_parser = _parse_for_target if target == "backup" else _parse_for_source
@@ -143,6 +180,10 @@ def secure_import(
         total_inserted = 0
 
         for entry in manifest["batches"]:
+            # Stop when limit reached
+            if limit is not None and total_inserted >= limit:
+                break
+
             batch_file = entry["file"]
             expected_checksum = entry["checksum"]
             expected_rows = entry["rows"]
@@ -169,6 +210,25 @@ def secure_import(
                 logger.warning(
                     f"Row count mismatch in {batch_file}: expected {expected_rows}, got {len(rows)}"
                 )
+
+            # Apply time filter (hours / range)
+            if use_time_filter:
+                filtered = []
+                for r in rows:
+                    ep = _get_row_epoch(r)
+                    if ep is None:
+                        filtered.append(r)
+                        continue
+                    if hours_cutoff is not None and ep <= hours_cutoff:
+                        continue
+                    if start_epoch is not None and not (start_epoch <= ep <= end_epoch):
+                        continue
+                    filtered.append(r)
+                rows = filtered
+
+            # Apply row limit cap
+            if limit is not None:
+                rows = rows[:limit - total_inserted]
 
             # Insert
             for i in range(0, len(rows), BATCH_SIZE):

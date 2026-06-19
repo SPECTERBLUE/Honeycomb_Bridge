@@ -45,9 +45,9 @@ ON messages (channel, time DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_update_time
 ON messages (update_time);
 
--- Prevent duplicate sensor readings
+-- Prevent duplicate sensor readings — matches production PK (time, publisher, subtopic, name)
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_messages
-ON messages (time, channel, name);
+ON messages (time, publisher, subtopic, name);
 
 -- ==============================
 -- Backup control
