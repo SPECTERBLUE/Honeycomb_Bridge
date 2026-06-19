@@ -14,6 +14,7 @@ import base64
 import json
 import logging
 import os
+import re
 import smtplib
 import subprocess
 import sys
@@ -515,13 +516,15 @@ if _AVAILABLE:
                         )
                     else:
                         _log.info(f"Scheduled restore completed:\n{output}")
+                        fetched_m = re.search(r"Records fetched\s*:\s*(\d+)", output)
+                        inserted_m = re.search(r"Records inserted\s*:\s*(\d+)", output)
                         _append_history(RESTORE_HISTORY_FILE, {
                             "start_time": start_ts.isoformat(),
                             "status": "SUCCESS",
                             "mode": mode,
                             "duration_seconds": duration,
-                            "rows_fetched": None,
-                            "rows_inserted": None,
+                            "rows_fetched": int(fetched_m.group(1)) if fetched_m else None,
+                            "rows_inserted": int(inserted_m.group(1)) if inserted_m else None,
                         })
 
                 elif mode == "range":
@@ -622,18 +625,23 @@ if _AVAILABLE:
         schedule_file = IMPORT_BACKUP_SCHEDULE_FILE if target == "backup" else IMPORT_PRODUCTION_SCHEDULE_FILE
         h, m = map(int, time_str.split(":"))
 
+        folder = kwargs.pop("folder", None)
+
         def _run_import_job():
             start_ts = datetime.now(timezone.utc)
             start_wall = time.monotonic()
             export_path = None
             try:
-                # Find latest export folder on NAS
-                ssh_tmp, sftp_tmp = sftp_connect(host, port, username, password)
-                try:
-                    export_path = find_latest_export(sftp_tmp, remote_base_path)
-                finally:
-                    sftp_tmp.close()
-                    ssh_tmp.close()
+                if folder:
+                    export_path = f"{remote_base_path.rstrip('/')}/{folder}"
+                else:
+                    # Auto-pick the latest export_* folder on NAS
+                    ssh_tmp, sftp_tmp = sftp_connect(host, port, username, password)
+                    try:
+                        export_path = find_latest_export(sftp_tmp, remote_base_path)
+                    finally:
+                        sftp_tmp.close()
+                        ssh_tmp.close()
 
                 import_kwargs = {}
                 if mode == "limit":

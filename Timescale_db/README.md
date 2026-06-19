@@ -822,16 +822,25 @@ Response:
 
 ## 27–29. Secure Import — Backup DB Schedule
 
-Daily automated import from NAS → TimescaleDB (Backup DB). On each run the scheduler automatically finds the **latest** `export_*` folder under `remote_path` — no need to update the schedule when a new export is created. Persisted to `import_backup_schedule.json`.
+Daily automated import from NAS → TimescaleDB (Backup DB). On each run the scheduler automatically finds the **latest** `export_*` folder under `remote_path` — no need to update the schedule when a new export is created. Optionally pin a specific folder using the `folder` field. Persisted to `import_backup_schedule.json`.
 
 ### Modes
 
 | Mode | What it does | Required fields |
 |------|-------------|-----------------|
-| `full` | (default) Imports all rows from the latest export folder | — |
-| `limit` | Imports the N most-recent rows | `limit` |
+| `full` | (default) Imports all rows from the export folder | — |
+| `limit` | Imports the first N rows | `limit` |
 | `hours` | Imports rows with `update_time` in the last N hours | `hours` |
 | `range` | Imports rows with `update_time` between two datetimes | `start`, `end` |
+
+### Folder selection
+
+| `folder` field | Behaviour |
+|----------------|-----------|
+| Omitted (default) | Auto-picks the **latest** `export_*` subfolder under `remote_path` each run |
+| `"export_20260618_232000"` | Always imports from that specific folder every run |
+
+> **Tip:** If your NAS backup runs in `mode=limit` or `mode=range`, the latest export folder may be partial. Pin the specific full-export folder using `folder` to guarantee complete data.
 
 ### 27. POST /downlink/guardian/secure-import/backup-db/schedule
 
@@ -850,6 +859,19 @@ curl -X POST "http://localhost:4567/downlink/guardian/secure-import/backup-db/sc
     "username": "honeycomb",
     "password": "your-password",
     "remote_path": "/home/honeycomb/backups",
+    "mode": "full"
+  }'
+
+# Pin a specific export folder (use when latest export is partial)
+curl -X POST "http://localhost:4567/downlink/guardian/secure-import/backup-db/schedule" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "time": "04:00", "timezone": "Asia/Kolkata",
+    "host": "192.168.1.15", "port": 22,
+    "username": "honeycomb", "password": "your-password",
+    "remote_path": "/home/honeycomb/backups",
+    "folder": "export_20260618_232000",
     "mode": "full"
   }'
 
@@ -940,14 +962,14 @@ Daily automated import from NAS → Production DB (Magistrala). Same behavior as
 
 ### Modes
 
-Same four modes: `full`, `limit`, `hours`, `range` — identical behavior as the backup-db schedule.
+Same four modes: `full`, `limit`, `hours`, `range` — identical behavior as the backup-db schedule. `folder` field also works the same way (omit to auto-pick latest, or specify a folder name to pin it).
 
 ### 30. POST /downlink/guardian/secure-import/production-db/schedule
 
 Requires Bearer token. Returns **409** if a schedule already exists — DELETE it first.
 
 ```bash
-# Full import nightly
+# Full import nightly (auto-picks latest export folder)
 curl -X POST "http://localhost:4567/downlink/guardian/secure-import/production-db/schedule" \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
@@ -959,6 +981,19 @@ curl -X POST "http://localhost:4567/downlink/guardian/secure-import/production-d
     "username": "honeycomb",
     "password": "your-password",
     "remote_path": "/home/honeycomb/backups",
+    "mode": "full"
+  }'
+
+# Pin a specific export folder
+curl -X POST "http://localhost:4567/downlink/guardian/secure-import/production-db/schedule" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "time": "05:00", "timezone": "Asia/Kolkata",
+    "host": "192.168.1.15", "port": 22,
+    "username": "honeycomb", "password": "your-password",
+    "remote_path": "/home/honeycomb/backups",
+    "folder": "export_20260618_232000",
     "mode": "full"
   }'
 

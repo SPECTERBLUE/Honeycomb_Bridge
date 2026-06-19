@@ -3468,6 +3468,7 @@ class ImportScheduleRequest(BaseModel):
     hours: Optional[int] = Field(None, gt=0, description="Required for mode=hours")
     start: Optional[str] = Field(None, description="Required for mode=range. ISO datetime e.g. 2026-06-01T00:00:00")
     end: Optional[str] = Field(None, description="Required for mode=range. ISO datetime e.g. 2026-06-07T23:59:59")
+    folder: Optional[str] = Field(None, description="Specific export_* folder name to import from. Omit to auto-pick the latest.")
 
 
 def _validate_import_request(req: ImportScheduleRequest):
@@ -4448,6 +4449,8 @@ def _import_schedule_post(req: ImportScheduleRequest, target: str,
             "remote_base_path": req.remote_path,
             "mode": req.mode, "user_id": current_user.id,
         }
+        if req.folder:
+            persist["folder"] = req.folder
 
         if req.mode == "limit":
             kwargs["limit"] = req.limit
@@ -4464,7 +4467,7 @@ def _import_schedule_post(req: ImportScheduleRequest, target: str,
         _apply_import_schedule(
             req.time, req.timezone, target,
             req.host, req.port, req.username, req.password,
-            req.remote_path, req.mode, **kwargs,
+            req.remote_path, req.mode, folder=req.folder, **kwargs,
         )
         with open(schedule_file, "w") as f:
             json.dump(persist, f, indent=2)
