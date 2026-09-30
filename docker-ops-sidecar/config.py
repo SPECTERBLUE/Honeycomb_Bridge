@@ -15,7 +15,6 @@ CONTAINER_CHIRPSTACK = os.environ.get(
 CONTAINER_VAULT = os.environ.get(
     "CONTAINER_VAULT", "edgex-security-secretstore-setup"
 )
-CONTAINER_SUPERSET = os.environ.get("CONTAINER_SUPERSET", "superset_app")
 
 # Path to the Vault root-init JSON file inside CONTAINER_VAULT.
 VAULT_ROOT_PATH = os.environ.get(

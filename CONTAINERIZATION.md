@@ -36,7 +36,6 @@ Referenced via env-configured hostnames, never `localhost`, in production:
 - **ChirpStack** — gRPC `:8088`, HTTP `:8090`
 - **EdgeX Vault** — `:8200`
 - **EdgeX notifications service** — `:59860`
-- **Superset** — `:8018`
 
 If these run in their own Compose stack, join this network as an `external: true`
 network reference rather than duplicating them here.
@@ -49,10 +48,9 @@ network reference rather than duplicating them here.
    committed to git history, treat them as compromised and rotate regardless.
 
 2. **`docker exec` calls to sibling containers** (`api_downlink.py`) currently shell
-   out to four containers by name: `chirpstack-chirpstack-1` (create API key, ~line
+   out to three containers by name: `chirpstack-chirpstack-1` (create API key, ~line
    1301), `edgex-security-proxy-setup` (create user, ~line 1244),
-   `edgex-security-secretstore-setup` (read the Vault root-init token, ~line 1342),
-   and `superset_app` (create user / change password, ~lines 1477 and 1620). This
+   and `edgex-security-secretstore-setup` (read the Vault root-init token, ~line 1342). This
    won't work from inside the `api` container without mounting
    `/var/run/docker.sock`, which grants host-level Docker control to anything that
    compromises that container.
@@ -67,11 +65,9 @@ network reference rather than duplicating them here.
    the EdgeX proxy user and for reading secrets instead of `cat`-ing the root-init
    file) — the sidecar is a bridge, not a permanent fixture.
 
-   Two pre-existing issues worth fixing regardless of this migration: the Vault
+   A pre-existing issue worth fixing regardless of this migration: the Vault
    root-init token is read live via `docker exec cat` rather than coming from a
-   secrets manager, and the Superset password-change endpoint passes the old/new
-   password as plaintext argv into `python3 -c` inside the container (visible to
-   anything that can read that container's process list).
+   secrets manager.
 
 3. **`localhost`-based URLs in `config.py`** need to become env-configurable service
    names/hostnames (`auth-db`, `timescaledb`, `redis`, plus the external hosts

@@ -49,10 +49,10 @@
 # api's image on purpose — torch/xgboost/scikit-learn/CUDA are 5-8GB+
 # (Predictive_ML/requirements.txt, layered on top of the slim root one).
 #
-# Magistrala's main gateway/user-service and Superset are not in any Compose stack
+# Magistrala's main gateway/user-service are not in any Compose stack
 # this repo has visibility into — they're reached via host.docker.internal, i.e.
-# assumed to be running directly on the host. Update BASE_URL / USERS_SERVICE_URL /
-# SUPERSET_BASE_URL in .env if that's not the case in your environment.
+# assumed to be running directly on the host. Update BASE_URL / USERS_SERVICE_URL
+# in .env if that's not the case in your environment.
 
 networks:
   honeycomb-net:

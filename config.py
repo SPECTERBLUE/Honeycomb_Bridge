@@ -56,7 +56,6 @@ BASE_URL                  = os.environ.get("BASE_URL", "http://localhost:80")   
 USERS_SERVICE_URL         = os.environ.get("USERS_SERVICE_URL", "http://localhost:9002")          # Magistrala user service (password reset etc.) - https://iot.meridiandatalabs.com/
 EDGEX_VAULT_BASE_URL      = os.environ.get("EDGEX_VAULT_BASE_URL", "http://localhost:8200")       # EdgeX Vault (JWT / OIDC token endpoint) - https://rapid.meridiandatalabs.com/vault/
 EDGEX_NOTIFICATION_BASE_URL = os.environ.get("EDGEX_NOTIFICATION_BASE_URL", "http://localhost:59860")  # EdgeX notification service - https://rapid.meridiandatalabs.com/support-notifications/
-SUPERSET_BASE_URL         = os.environ.get("SUPERSET_BASE_URL", "http://localhost:8018")          # Apache Superset dashboard - https://superset.meridiandatalabs.com/
 
 # -----------------------------------------------------------------------------
 #  External / Cloud Service URLs
@@ -68,7 +67,7 @@ FRONTEND_URL = "https://honeycomb.meridiandatalabs.com/auth"  # Frontend app (us
 
 
 # -----------------------------------------------------------------------------
-#  docker-ops-sidecar  (brokers docker exec into chirpstack/edgex/superset — see
+#  docker-ops-sidecar  (brokers docker exec into chirpstack/edgex — see
 #  CONTAINERIZATION.md item 2; container names + Vault path now live in
 #  docker-ops-sidecar/config.py, not here)
 # -----------------------------------------------------------------------------
