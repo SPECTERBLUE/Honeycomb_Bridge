@@ -3,8 +3,7 @@ from fastapi.responses import JSONResponse
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from SMTP_init import LoginAlertMailer
-from pydantic import BaseModel, Field, field_validator, EmailStr
-from pydantic import FieldValidationInfo
+from pydantic import BaseModel, Field, EmailStr
 from pydantic import BaseModel, Field
 from typing import Literal, Optional, Dict
 from fastapi.exceptions import RequestValidationError
@@ -451,33 +450,6 @@ def disable_login_alert(current_user = Depends(auth.get_current_user), db: Sessi
     
 # reset password by email link
 
-def forgot_password_superset(email: EmailStr, new_password: str):
-    """Force-reset a user's Superset password with no old-password check — the caller
-    has already been authenticated via a one-time reset token (verify_reset_token),
-    not the old password itself. Goes through docker-ops-sidecar, the only container
-    that mounts /var/run/docker.sock (see CONTAINERIZATION.md item 2) — api has no
-    docker socket, so a direct `docker exec` here would fail at runtime.
-    """
-    try:
-        resp = requests.post(
-            f"{config.DOCKER_OPS_SIDECAR_URL}/superset/reset-password",
-            json={"email": email, "new_password": new_password},
-            headers=SIDECAR_HEADERS,
-            timeout=15,
-        )
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"docker-ops-sidecar unreachable: {e}"
-        )
-
-    if resp.status_code != 200:
-        _sidecar_error_to_http(resp)
-
-    return {
-        "status": "success",
-        "message": f"Password updated for '{email}'."
-    }
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr   # account email (primary login email)
 
@@ -581,8 +553,6 @@ def reset_password(req: ResetPasswordRequest, db: Session = Depends(get_db)):
             status_code=503,
             detail=f"User service unreachable: {str(e)}"
         )
-
-    forgot_password_superset(email, new_pw)
 
     return {"message": "Password updated successfully"}
 
@@ -1324,69 +1294,6 @@ def get_tokens( auth: str = Depends(auth.validate_token)):
         "root_token": resp.json().get("root_token")
     }
 
-''' This section is for creating a new user in Apache Superset, via docker-ops-sidecar. '''
-
-class UserCreate(BaseModel):
-    username: str = Field(..., example="string")
-    first_name: str = Field("", example="string")
-    last_name: str = Field("", example="string")
-    email: str = Field(..., example="string")   
-    password: str = Field(..., example="string")
-    role: str = Field(..., example="Admin")
-
-    @field_validator('email')
-    @classmethod
-    def validate_email(cls, v: str) -> str:
-        email_regex = re.compile(
-            r'^[a-zA-Z0-9]+([._-][a-zA-Z0-9]+)*@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        )
-        if not email_regex.match(v):
-            raise ValueError("Invalid email format")
-        return v
-
-    @field_validator('password')
-    @classmethod
-    def validate_password(cls, v: str, info: FieldValidationInfo) -> str:
-        values = info.data
-        email = values.get('email', '').lower()
-        password = v.lower()
-
-        # Identity restriction for @gmail.com
-        if email.endswith('@gmail.com'):
-            local_part = email.split('@')[0]
-
-            if any(sep in local_part for sep in ['.', '-', '_']):
-                parts = re.split(r'[._-]', local_part)
-                for part in parts:
-                    if part and part in password:
-                        raise ValueError(
-                            f"Password must not contain parts of your email address: '{part}'"
-                        )
-            else:
-                if local_part in password:
-                    raise ValueError(
-                        f"Password must not contain the email local part: '{local_part}'"
-                    )
-
-        # Password strength checks
-        if len(v) < 8:
-            raise ValueError('Password must be at least 8 characters long')
-
-        if not re.search(r'[A-Z]', v):
-            raise ValueError('Password must contain at least one uppercase letter')
-
-        if not re.search(r'[a-z]', v):
-            raise ValueError('Password must contain at least one lowercase letter')
-
-        if not re.search(r'\d', v):
-            raise ValueError('Password must contain at least one digit')
-
-        if not re.search(r'\W', v):
-            raise ValueError('Password must contain at least one special character')
-
-        return v
-
-
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError, auth: str = Depends(auth.validate_token)):
     errors = exc.errors()
@@ -1408,134 +1315,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
-@app.post("/downlink/create_superset_user", status_code=status.HTTP_200_OK)
-async def create_superset_user(user: UserCreate, auth: str = Depends(auth.validate_token)):
-    if not user.username or not user.email or not user.password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username, email, and password are required."
-        )
-
-    try:
-        resp = requests.post(
-            f"{config.DOCKER_OPS_SIDECAR_URL}/superset/create-user",
-            json={
-                "username": user.username,
-                "first_name": user.first_name,
-                "last_name": user.last_name,
-                "email": user.email,
-                "password": user.password,
-                "role": user.role,
-            },
-            headers=SIDECAR_HEADERS,
-            timeout=15,
-        )
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"docker-ops-sidecar unreachable: {e}"
-        )
-
-    if resp.status_code != 200:
-        _sidecar_error_to_http(resp)
-
-    return {
-        "status": "success",
-        "code": 200,
-        "message": f"User '{user.username}' created successfully.",
-        "stdout": resp.json().get("stdout", "")
-    }
-
-
-class PasswordChangeRequest(BaseModel):
-    email: EmailStr
-    old_password: str 
-    new_password: str 
-    confirm_password: str
-
-
-@app.post("/downlink/change_password", status_code=status.HTTP_200_OK)
-async def change_password(body: PasswordChangeRequest, auth: str = Depends(auth.validate_token)):
-    # 1. Password pattern: At least 8 chars, one uppercase, one lowercase, one digit, one special char
-    password_pattern = re.compile(
-        r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)"
-        r"(?=.*[!@#$%^&*()_\-+=\[{\]};:'\",<.>/?\\|`~]).{8,}$"
-    )
-    if not password_pattern.match(body.new_password):
-        raise HTTPException(
-            status_code=400,
-            detail="Password must be at least 8 characters long, "
-                   "contain at least one uppercase letter, one lowercase letter, "
-                   "one digit, and one special character."
-        )
-
-    # 2. Confirm new_password and confirm_password match
-    if body.new_password != body.confirm_password:
-        raise HTTPException(
-            status_code=400,
-            detail="New password and confirm password do not match."
-        )
-
-    # 3. Prevent reusing the old password
-    if body.old_password == body.new_password:
-        raise HTTPException(
-            status_code=400,
-            detail="New password cannot be the same as the old password."
-        )
-
-    # 4. Gmail-specific logic: Reject if new password contains local part or any split parts
-    email = body.email.lower()
-    new_password_lower = body.new_password.lower()
-
-    if email.endswith("@gmail.com"):
-        local_part = email.split("@")[0]
-
-        # Full local part not allowed in password
-        if local_part in new_password_lower:
-            raise HTTPException(
-                status_code=400,
-                detail="Password cannot contain your emal username."
-            )
-
-        # If contains '.', '_', or '-', check individual parts
-        if any(sep in local_part for sep in ['.', '_', '-']):
-            parts = re.split(r"[._-]", local_part)
-            for part in parts:
-                if part and part in new_password_lower:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Password cannot contain parts of your email address: '{part}'"
-                    )
-
-    # 5. Change the Superset user password via docker-ops-sidecar (see
-    #    CONTAINERIZATION.md item 2 — the script that runs inside the superset
-    #    container now lives in docker-ops-sidecar/main.py)
-    try:
-        resp = requests.post(
-            f"{config.DOCKER_OPS_SIDECAR_URL}/superset/change-password",
-            json={
-                "email": body.email,
-                "old_password": body.old_password,
-                "new_password": body.new_password,
-            },
-            headers=SIDECAR_HEADERS,
-            timeout=15,
-        )
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"docker-ops-sidecar unreachable: {e}"
-        )
-
-    if resp.status_code != 200:
-        _sidecar_error_to_http(resp)
-
-    return {
-        "status": "success",
-        "code": 200,
-        "message": f"Password updated for '{body.email}'.",
-        "stdout": resp.json().get("stdout", "")
-    }
 class CaptchaVerifyRequest(BaseModel):
     captcha_id: str
     encrypted_input: dict  # { "iv": ..., "ciphertext": ..., "tag": ... }
@@ -2776,34 +2555,6 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
         
     logging.info(f"First ChirpStack tenant ID: {first_tenant_id}")
     
-    # 10. login for superset and get the token
-
-    # Superset accounts are provisioned once with config.encrypted_user/encrypted_pass
-    # (fixed iv/ciphertext/tag) as the username/password — re-encrypting the logged-in
-    # user's own credentials here would produce a different string every call (random
-    # IV per encryption) and could never match what the Superset account was created with.
-
-    superset_identity = f"{config.encrypted_user['iv']}:{config.encrypted_user['ciphertext']}:{config.encrypted_user['tag']}"
-    superset_secret = f"{config.encrypted_pass['iv']}:{config.encrypted_pass['ciphertext']}:{config.encrypted_pass['tag']}"
-    
-    superset_login_response = requests.post(
-        f"{config.SUPERSET_BASE_URL}/api/v1/security/login",
-        json={
-            "username": superset_identity,
-            "password": superset_secret,
-            "provider": "db",
-            "refresh": True
-        })
-    if superset_login_response.status_code != 200:
-        logging.error(
-            f"Failed to authenticate with Superset: "
-            f"status={superset_login_response.status_code}, body={superset_login_response.text}"
-        )
-        raise HTTPException(status_code=500, detail="Failed to authenticate with Superset")
-    
-    superset_access_token = superset_login_response.json().get("access_token")
-    superset_refresh_token = superset_login_response.json().get("refresh_token")
-    
     # session management and concurrnt session check
     
     sesson_management_response = requests.post(
@@ -2825,8 +2576,6 @@ async def honeycomb_auth(body: HoneycombAuthRequest, http_request: Request, db: 
         "magistrala_refresh_token": magistrala_refresh_token,
         "edgex_token": edgex_token,
         "edgex_jwt": edgex_jwt,
-        "superset_access_token": superset_access_token,
-        "superset_refresh_token": superset_refresh_token,
         "session_token": session_token,
         "chirpstack_token": config.API_TOKEN,
         "chirpstack_tenant_id": first_tenant_id,
