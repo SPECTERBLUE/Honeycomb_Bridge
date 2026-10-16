@@ -5,6 +5,7 @@ from iot_worker.device_manager import device_manager
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization
 from Crypto.Cipher import AES
+from Crypto.Hash import CMAC, SHA256
 from binascii import hexlify
 from typing import Tuple
 from Crypto.Util.Padding import unpad
@@ -118,8 +119,16 @@ class SharedKey:
         return None
 
 class SensorCrypto:
-    """Handles encryption and decryption of data using AES (CBC mode)."""
-    
+    """
+    Handles encryption and decryption of data using AES (CBC mode),
+    authenticated with an 8-byte truncated AES-CMAC (encrypt-then-MAC).
+
+    Wire format: ciphertext || CMAC(mac_key, ciphertext)[:8]
+    mac_key = SHA-256(shared_secret || b"CMAC")  (separate from the CBC key)
+    """
+
+    MAC_KEY_LABEL = b"CMAC"
+
     def __init__(self, shared_secret_hex: str, iv_dev):
         """
         Initialize encryption with a derived shared secret.
@@ -130,18 +139,34 @@ class SensorCrypto:
             logging.debug("Initializing SensorCrypto with shared secret.")
             self.shared_secret = bytes.fromhex(shared_secret_hex) # Use only the first 16 bytes
             self.iv = bytes.fromhex(iv_dev) if iv_dev else None # Initialization Vector (IV) set to device-specific value
+            # Derive a separate key for CMAC so the CBC key is never reused for MAC
+            self.mac_key = SHA256.new(self.shared_secret + self.MAC_KEY_LABEL).digest()
+            self.tag_len = config.SENSOR_CMAC_TAG_LEN
 
             logging.info("SensorCrypto successfully initialized.")
         except Exception as e:
             logging.error(f"Error initializing SensorCrypto: {e}", exc_info=True)
             self.shared_secret = None
+            self.mac_key = None
+
+    def compute_cmac(self, data: bytes) -> bytes:
+        """Compute the truncated AES-CMAC tag over data."""
+        return CMAC.new(self.mac_key, msg=data, ciphermod=AES, mac_len=self.tag_len).digest()
+
+    def verify_cmac(self, data: bytes, tag: bytes) -> bool:
+        """Verify a truncated AES-CMAC tag (constant-time)."""
+        try:
+            CMAC.new(self.mac_key, msg=data, ciphermod=AES, mac_len=self.tag_len).verify(tag)
+            return True
+        except ValueError:
+            return False
 
     def encrypt(self, plaintext: bytes) -> Tuple[bytes, str]:
         """
-        Encrypts data using AES-CBC.
+        Encrypts data using AES-CBC and appends an 8-byte AES-CMAC tag.
 
         :param plaintext: Data to be encrypted (bytes).
-        :return: Tuple containing raw encrypted bytes and hex representation.
+        :return: Tuple containing raw encrypted bytes (ciphertext || tag) and hex representation.
         """
         try:
             logging.debug("Encrypting data...")
@@ -152,6 +177,8 @@ class SensorCrypto:
 
             cipher = AES.new(self.shared_secret, AES.MODE_CBC, iv=self.iv)
             encrypted_bytes = cipher.encrypt(plaintext_padded)
+            if config.SENSOR_CMAC_ENABLED:
+                encrypted_bytes += self.compute_cmac(encrypted_bytes)
 
             encrypted_hex = encrypted_bytes.hex()
             logging.info("Data encrypted successfully.")
@@ -165,14 +192,24 @@ class SensorCrypto:
 
     def decrypt(self, encrypted_hex: str) -> bytes:
         """
-        Decrypts encrypted data using AES-CBC.
+        Verifies the 8-byte AES-CMAC tag, then decrypts data using AES-CBC.
 
-        :param encrypted_hex: Hexadecimal string of encrypted data.
-        :return: Decrypted data as bytes.
+        :param encrypted_hex: Hexadecimal string of ciphertext || tag.
+        :return: Decrypted data as bytes, or None if the tag is invalid.
         """
         try:
             logging.debug("Decrypting data...")
             encrypted_bytes = bytes.fromhex(encrypted_hex)
+
+            if config.SENSOR_CMAC_ENABLED:
+                if len(encrypted_bytes) <= self.tag_len:
+                    logging.error(f"Payload too short for CMAC tag: {len(encrypted_bytes)} bytes")
+                    return None
+                encrypted_bytes, tag = encrypted_bytes[:-self.tag_len], encrypted_bytes[-self.tag_len:]
+                if not self.verify_cmac(encrypted_bytes, tag):
+                    logging.error(f"CMAC verification failed (tag: {tag.hex()}) - payload rejected")
+                    return None
+                logging.debug("CMAC verified successfully.")
 
             cipher = AES.new(self.shared_secret, AES.MODE_CBC, iv=self.iv)
             logging.info(f"shared_key: {self.shared_secret.hex()}")

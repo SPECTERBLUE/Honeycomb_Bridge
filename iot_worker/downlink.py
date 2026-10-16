@@ -238,6 +238,9 @@ def process_downlink_packet(packet: str):
         sc = device_crypto[dev_eui]
         try:
             decrypted_data = sc.decrypt(data)
+            if decrypted_data is None:
+                logging.warning(f"Dropping uplink from {dev_eui}: CMAC/decryption failed.")
+                return
             logging.info(f"Decrypted Sensor Data for device {dev_eui}: {decrypted_data}")
         except Exception as e:
             logging.error(f"Decryption failed for device {dev_eui}: {e}", exc_info=True)

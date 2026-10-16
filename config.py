@@ -178,3 +178,10 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "bhew gqyo hfrv pqrk")   # App p
 # -----------------------------------------------------------------------------
 
 SYMETRIC_CYPHERING = True   # True = symmetric (AES), False = asymmetric
+
+# -----------------------------------------------------------------------------
+#  Sensor Payload Integrity (AES-CMAC)
+# -----------------------------------------------------------------------------
+
+SENSOR_CMAC_ENABLED = os.environ.get("SENSOR_CMAC_ENABLED", "true").lower() == "true"  # Require 8-byte AES-CMAC tag on sensor uplinks
+SENSOR_CMAC_TAG_LEN = 8   # Truncated CMAC tag length in bytes (appended after ciphertext)
