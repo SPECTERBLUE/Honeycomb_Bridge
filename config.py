@@ -185,3 +185,4 @@ SYMETRIC_CYPHERING = True   # True = symmetric (AES), False = asymmetric
 
 SENSOR_CMAC_ENABLED = os.environ.get("SENSOR_CMAC_ENABLED", "true").lower() == "true"  # Require 8-byte AES-CMAC tag on sensor uplinks
 SENSOR_CMAC_TAG_LEN = 8   # Truncated CMAC tag length in bytes (appended after ciphertext)
+DOWNLINK_ENCRYPTION_ENABLED = os.environ.get("DOWNLINK_ENCRYPTION_ENABLED", "true").lower() == "true"  # Encrypt command downlinks (AES-CBC + CMAC); key-exchange downlinks stay plaintext
