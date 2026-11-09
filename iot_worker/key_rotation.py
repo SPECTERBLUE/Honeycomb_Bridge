@@ -5,9 +5,10 @@ from iot_worker.device_manager import device_manager
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization
 from Crypto.Cipher import AES
+from Crypto.Hash import CMAC, SHA256
 from binascii import hexlify
 from typing import Tuple
-from Crypto.Util.Padding import unpad
+from Crypto.Util.Padding import pad, unpad
 import config
 #from dataclasses import dataclass
 #import struct
@@ -118,8 +119,16 @@ class SharedKey:
         return None
 
 class SensorCrypto:
-    """Handles encryption and decryption of data using AES (CBC mode)."""
-    
+    """
+    Handles encryption and decryption of data using AES (CBC mode),
+    authenticated with an 8-byte truncated AES-CMAC (encrypt-then-MAC).
+
+    Wire format: ciphertext || CMAC(mac_key, ciphertext)[:8]
+    mac_key = SHA-256(shared_secret || b"CMAC")  (separate from the CBC key)
+    """
+
+    MAC_KEY_LABEL = b"CMAC"
+
     def __init__(self, shared_secret_hex: str, iv_dev):
         """
         Initialize encryption with a derived shared secret.
@@ -130,28 +139,45 @@ class SensorCrypto:
             logging.debug("Initializing SensorCrypto with shared secret.")
             self.shared_secret = bytes.fromhex(shared_secret_hex) # Use only the first 16 bytes
             self.iv = bytes.fromhex(iv_dev) if iv_dev else None # Initialization Vector (IV) set to device-specific value
+            # Derive a separate key for CMAC so the CBC key is never reused for MAC
+            self.mac_key = SHA256.new(self.shared_secret + self.MAC_KEY_LABEL).digest()
+            self.tag_len = config.SENSOR_CMAC_TAG_LEN
 
             logging.info("SensorCrypto successfully initialized.")
         except Exception as e:
             logging.error(f"Error initializing SensorCrypto: {e}", exc_info=True)
             self.shared_secret = None
+            self.mac_key = None
+
+    def compute_cmac(self, data: bytes) -> bytes:
+        """Compute the truncated AES-CMAC tag over data."""
+        return CMAC.new(self.mac_key, msg=data, ciphermod=AES, mac_len=self.tag_len).digest()
+
+    def verify_cmac(self, data: bytes, tag: bytes) -> bool:
+        """Verify a truncated AES-CMAC tag (constant-time)."""
+        try:
+            CMAC.new(self.mac_key, msg=data, ciphermod=AES, mac_len=self.tag_len).verify(tag)
+            return True
+        except ValueError:
+            return False
 
     def encrypt(self, plaintext: bytes) -> Tuple[bytes, str]:
         """
-        Encrypts data using AES-CBC.
+        Encrypts data using AES-CBC and appends an 8-byte AES-CMAC tag.
 
         :param plaintext: Data to be encrypted (bytes).
-        :return: Tuple containing raw encrypted bytes and hex representation.
+        :return: Tuple containing raw encrypted bytes (ciphertext || tag) and hex representation.
         """
         try:
             logging.debug("Encrypting data...")
             
-            # Padding (PKCS7-style with NULL bytes)
-            pad_len = 16 - (len(plaintext) % 16)
-            plaintext_padded = plaintext + (b'\0' * pad_len)
+            # PKCS7 padding (matches decrypt() and the device firmware)
+            plaintext_padded = pad(plaintext, AES.block_size)
 
             cipher = AES.new(self.shared_secret, AES.MODE_CBC, iv=self.iv)
             encrypted_bytes = cipher.encrypt(plaintext_padded)
+            if config.SENSOR_CMAC_ENABLED:
+                encrypted_bytes += self.compute_cmac(encrypted_bytes)
 
             encrypted_hex = encrypted_bytes.hex()
             logging.info("Data encrypted successfully.")
@@ -165,14 +191,24 @@ class SensorCrypto:
 
     def decrypt(self, encrypted_hex: str) -> bytes:
         """
-        Decrypts encrypted data using AES-CBC.
+        Verifies the 8-byte AES-CMAC tag, then decrypts data using AES-CBC.
 
-        :param encrypted_hex: Hexadecimal string of encrypted data.
-        :return: Decrypted data as bytes.
+        :param encrypted_hex: Hexadecimal string of ciphertext || tag.
+        :return: Decrypted data as bytes, or None if the tag is invalid.
         """
         try:
             logging.debug("Decrypting data...")
             encrypted_bytes = bytes.fromhex(encrypted_hex)
+
+            if config.SENSOR_CMAC_ENABLED:
+                if len(encrypted_bytes) <= self.tag_len:
+                    logging.error(f"Payload too short for CMAC tag: {len(encrypted_bytes)} bytes")
+                    return None
+                encrypted_bytes, tag = encrypted_bytes[:-self.tag_len], encrypted_bytes[-self.tag_len:]
+                if not self.verify_cmac(encrypted_bytes, tag):
+                    logging.error(f"CMAC verification failed (tag: {tag.hex()}) - payload rejected")
+                    return None
+                logging.debug("CMAC verified successfully.")
 
             cipher = AES.new(self.shared_secret, AES.MODE_CBC, iv=self.iv)
             logging.info(f"shared_key: {self.shared_secret.hex()}")
@@ -238,26 +274,36 @@ class KeyRotationManager:
         self.channel = channel
         self.auth_token = auth_token
 
-    def queue_downlink(self, dev_eui, payload, f_port):
+    def queue_downlink(self, dev_eui, payload, f_port, encrypt=False):
         """
         Sends a downlink message to a device or all devices.
 
         :param dev_eui: Device EUI (or "ALL" for broadcasting).
         :param payload: Payload to be sent in the downlink.
         :param f_port: FPort number for the message.
+        :param encrypt: Encrypt with the device's SensorCrypto (AES-CBC + CMAC).
+                        Key-exchange messages must stay plaintext (encrypt=False).
+        :return: True if queued, False otherwise.
         """
         logging.info(f"Queuing downlink for device {dev_eui} on FPort {f_port}")
         
         try:
-            # Convert payload to a hex-encoded byte sequence
-            data_hex = payload.encode("utf-8").hex()
-            # Ensure even-length by padding if needed
-            if len(data_hex) % 2 != 0:
-                data_hex = "0" + data_hex  # Prepend '0' to make length even
+            data_bytes = payload.encode("utf-8")
 
-            data_bytes = bytes.fromhex(data_hex)
-            logging.info(f"Sending Downlink Data (Hex): {data_hex}")
-            logging.info(f"Sending Downlink Data (Bytes): {data_bytes}")
+            if encrypt and config.DOWNLINK_ENCRYPTION_ENABLED:
+                from iot_worker.downlink import device_crypto
+                sc = device_crypto.get(dev_eui)
+                if not sc:
+                    # Fail closed: never fall back to plaintext for commands
+                    logging.error(f"No SensorCrypto for device {dev_eui} -> refusing to send unencrypted command on FPort {f_port}")
+                    return False
+                data_bytes, _ = sc.encrypt(data_bytes)
+                if data_bytes is None:
+                    logging.error(f"Encryption failed for device {dev_eui} -> downlink not sent")
+                    return False
+
+            logging.info(f"Sending Downlink Data (Hex): {data_bytes.hex()}")
+            logging.info(f"Sending Downlink Data (Bytes): {data_bytes}")
 
             # Create downlink request
             downlink_request = api.EnqueueDeviceQueueItemRequest(
@@ -275,9 +321,11 @@ class KeyRotationManager:
             response = device_queue_service.Enqueue(downlink_request, metadata=self.auth_token)
 
             logging.info(f"Downlink Response: {response}")
+            return True
 
         except Exception as e:
             logging.error(f"Error queuing downlink for {dev_eui}: {e}", exc_info=True)
+            return False
 
     def rotate_keys(self):
         """Performs UA key rotation and notifies devices via downlink."""
@@ -334,8 +382,10 @@ class KeyRotationManager:
         reboot_payload = "REBOOT"
         
         try:
-            self.queue_downlink(dev_eui, reboot_payload, f_port=config.DL_REBOOT)
+            if not self.queue_downlink(dev_eui, reboot_payload, f_port=config.DL_REBOOT, encrypt=True):
+                return False
             logging.info(f"Reboot command sent successfully to device {dev_eui}.")
+            return True
         except Exception as e:
             logging.error(f"Failed to send reboot command to device {dev_eui}: {e}", exc_info=True)
 
@@ -346,8 +396,10 @@ class KeyRotationManager:
         data_transmission_frequency = "UPDATE_FREQUENCY:" + str(update_frequency)
         
         try:
-            self.queue_downlink(dev_euid, data_transmission_frequency, f_port=config.DL_UPDATE_FREQUENCY)
+            if not self.queue_downlink(dev_euid, data_transmission_frequency, f_port=config.DL_UPDATE_FREQUENCY, encrypt=True):
+                return False
             logging.info(f"Update frequency {update_frequency} sent successfully to device {dev_euid}.")
+            return True
         except Exception as e:
             logging.error(f"Failed to send update frequency to device {dev_euid}: {e}", exc_info=True)   
 
@@ -358,8 +410,10 @@ class KeyRotationManager:
         device_status_payload = "DEVICE_STATUS"
         
         try:
-            self.queue_downlink(dev_euid, device_status_payload, f_port=config.DL_DEVICE_STATUS)
+            if not self.queue_downlink(dev_euid, device_status_payload, f_port=config.DL_DEVICE_STATUS, encrypt=True):
+                return False
             logging.info(f"Device status sent successfully to device {dev_euid}.")
+            return True
         except Exception as e:
             logging.error(f"Failed to send device status to device {dev_euid}: {e}", exc_info=True)
             
@@ -370,8 +424,10 @@ class KeyRotationManager:
         set_log_level_payload = "SET_LOG_LEVEL:" + str(level)
         
         try:
-            self.queue_downlink(dev_euid, set_log_level_payload, f_port=config.DL_LOG_LEVEL)
+            if not self.queue_downlink(dev_euid, set_log_level_payload, f_port=config.DL_LOG_LEVEL, encrypt=True):
+                return False
             logging.info(f"Log level {level} set successfully for device {dev_euid}.")
+            return True
         except Exception as e:
             logging.error(f"Failed to set log level for device {dev_euid}: {e}", exc_info=True)
             
@@ -382,8 +438,10 @@ class KeyRotationManager:
         time_sync_payload = "TIME_SYNC :" + str(int(time.time()))
         
         try:
-            self.queue_downlink(dev_euid, time_sync_payload, f_port=config.DL_TIME_SYNC)
+            if not self.queue_downlink(dev_euid, time_sync_payload, f_port=config.DL_TIME_SYNC, encrypt=True):
+                return False
             logging.info(f"Time sync command sent successfully to device {dev_euid}.")
+            return True
         except Exception as e:
             logging.error(f"Failed to send time sync command to device {dev_euid}: {e}", exc_info=True)
             
@@ -394,8 +452,10 @@ class KeyRotationManager:
         factory_reset_payload = "RESET_FACTORY"
         
         try:
-            self.queue_downlink(dev_euid, factory_reset_payload, f_port=config.DL_RESET_FACTORY)
+            if not self.queue_downlink(dev_euid, factory_reset_payload, f_port=config.DL_RESET_FACTORY, encrypt=True):
+                return False
             logging.info(f"Factory reset command sent successfully to device {dev_euid}.")
+            return True
         except Exception as e:
             logging.error(f"Failed to send factory reset command to device {dev_euid}: {e}", exc_info=True)
             

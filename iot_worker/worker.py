@@ -40,6 +40,12 @@ def _require_key_manager():
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="KeyRotationManager not initialized")
 
 
+def _require_sent(sent):
+    if not sent:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="Downlink not sent: no session key for this device yet (or enqueue failed)")
+
+
 @app.on_event("startup")
 def _startup():
     channel = grpc.insecure_channel(config.CHIRPSTACK_HOST)
@@ -60,42 +66,42 @@ def rotate_keys():
 @app.post("/devices/{dev_euid}/update-frequency", dependencies=[Depends(require_internal_token)])
 def update_frequency(dev_euid: str, update_frequency: int):
     _require_key_manager()
-    efp.key_manager.send_update_frequency(dev_euid, update_frequency)
+    _require_sent(efp.key_manager.send_update_frequency(dev_euid, update_frequency))
     return {"status": "success"}
 
 
 @app.post("/devices/{dev_euid}/reboot", dependencies=[Depends(require_internal_token)])
 def reboot(dev_euid: str):
     _require_key_manager()
-    efp.key_manager.send_reboot_command(dev_euid)
+    _require_sent(efp.key_manager.send_reboot_command(dev_euid))
     return {"status": "success"}
 
 
 @app.post("/devices/{dev_euid}/status", dependencies=[Depends(require_internal_token)])
 def device_status(dev_euid: str):
     _require_key_manager()
-    efp.key_manager.send_device_status(dev_euid)
+    _require_sent(efp.key_manager.send_device_status(dev_euid))
     return {"status": "success"}
 
 
 @app.post("/devices/{dev_euid}/log-level", dependencies=[Depends(require_internal_token)])
 def log_level(dev_euid: str, level: int):
     _require_key_manager()
-    efp.key_manager.set_log_level(dev_euid, level)
+    _require_sent(efp.key_manager.set_log_level(dev_euid, level))
     return {"status": "success"}
 
 
 @app.post("/devices/{dev_euid}/time-sync", dependencies=[Depends(require_internal_token)])
 def time_sync(dev_euid: str):
     _require_key_manager()
-    efp.key_manager.send_time_sync(dev_euid)
+    _require_sent(efp.key_manager.send_time_sync(dev_euid))
     return {"status": "success"}
 
 
 @app.post("/devices/{dev_euid}/reset-factory", dependencies=[Depends(require_internal_token)])
 def reset_factory(dev_euid: str):
     _require_key_manager()
-    efp.key_manager.send_reset_factory(dev_euid)
+    _require_sent(efp.key_manager.send_reset_factory(dev_euid))
     return {"status": "success"}
 
 
